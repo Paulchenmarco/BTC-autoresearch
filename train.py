@@ -23,8 +23,8 @@ DEPTH_BASE = 0.10
 DEPTH_MULT = 13.0
 
 # Put selling phase: earn premium while waiting for MVRV gate
-CSP_SELL_ABOVE = 0.95         # Only sell puts when MVRV > this
-CSP_CLOSE_BELOW = 0.90        # Force-close ALL puts when MVRV drops below this
+CSP_SELL_ABOVE = 1.10         # Only sell puts when MVRV > this (far from danger)
+CSP_CLOSE_BELOW = 1.00        # Force-close ALL puts when MVRV drops below this
 CSP_DELTA = 0.10              # Far OTM
 CSP_DTE = 30                  # Short DTE — fast cycling
 CSP_ALLOC = 0.20              # 20% of cash as collateral
