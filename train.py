@@ -17,16 +17,13 @@ from prepare import (
 # Strategy parameters (edit these)
 # ---------------------------------------------------------------------------
 
-# Conviction thresholds — when these align, deploy heavily
+# Gate: MVRV must be below this to buy
 MVRV_THRESHOLD = 0.80
-DIST_ATH_THRESHOLD = 0.75
-PL_RESID_THRESHOLD = -0.40
-RV30_THRESHOLD = 0.70
 
-# Deployment sizing: MVRV required + secondary signal count
-DEPLOY_4_SIGNALS = 0.50     # MVRV + 3/3 secondary: deploy 50%
-DEPLOY_3_SIGNALS = 0.30     # MVRV + 2/3 secondary: deploy 30%
-DEPLOY_2_SIGNALS = 0.15     # MVRV + 1/3 secondary: deploy 15%
+# Sizing: deploy more when volatility is elevated (panic selling = better prices)
+RV30_THRESHOLD = 0.70
+DEPLOY_HIGH_CONVICTION = 0.50   # MVRV < threshold AND rv30 > threshold
+DEPLOY_LOW_CONVICTION = 0.30    # MVRV < threshold AND rv30 <= threshold
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,30 +46,16 @@ def decide_action(features, portfolio):
         return Action()
 
     mvrv = _safe(features.get("mvrv_ratio"), 1.0)
-    dist_ath = _safe(features.get("distance_from_ath"), 0.0)
-    pl_resid = _safe(features.get("power_law_residual"), 0.0)
     rv30 = _safe(features.get("realized_vol_30d"), 0.40)
 
-    # Count secondary conviction signals (MVRV is mandatory gate)
-    secondary = 0
-    if dist_ath > DIST_ATH_THRESHOLD:
-        secondary += 1
-    if pl_resid < PL_RESID_THRESHOLD:
-        secondary += 1
-    if rv30 > RV30_THRESHOLD:
-        secondary += 1
-
-    # Deploy: MVRV must be below threshold, then scale by secondary signal count
     spot_buy = 0.0
     if mvrv < MVRV_THRESHOLD:
-        if secondary >= 3:
-            spot_buy = cash * DEPLOY_4_SIGNALS
-        elif secondary >= 2:
-            spot_buy = cash * DEPLOY_3_SIGNALS
-        elif secondary >= 1:
-            spot_buy = cash * DEPLOY_2_SIGNALS
+        if rv30 > RV30_THRESHOLD:
+            spot_buy = cash * DEPLOY_HIGH_CONVICTION
+        else:
+            spot_buy = cash * DEPLOY_LOW_CONVICTION
 
-        # If mostly deployed and small remainder, deploy all
+        # Deploy all remainder when small
         if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
             spot_buy = cash
 
