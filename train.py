@@ -80,19 +80,19 @@ def decide_action(features, portfolio):
                     notional_usd=collateral,
                 ))
 
-    # === PHASE 2: MVRV below gate — deploy spot ===
+    # === PHASE 2: MVRV below gate — close puts AND deploy spot same day ===
     else:
-        # Force-close any remaining puts first
+        # Force-close any remaining puts
         if len(portfolio.open_csps) > 0:
             close_indices = list(range(len(portfolio.open_csps)))
-        else:
-            # Deploy spot with depth scaling
-            depth = (MVRV_THRESHOLD - mvrv) / MVRV_THRESHOLD
-            frac = DEPTH_BASE + depth * DEPTH_MULT
-            frac = min(frac, 1.0)
-            spot_buy = cash * frac
-            if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
-                spot_buy = cash
+
+        # Deploy spot with depth scaling (validator accounts for freed cash)
+        depth = (MVRV_THRESHOLD - mvrv) / MVRV_THRESHOLD
+        frac = DEPTH_BASE + depth * DEPTH_MULT
+        frac = min(frac, 1.0)
+        spot_buy = cash * frac
+        if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
+            spot_buy = cash
 
     return Action(spot_buy_usd=spot_buy, csp_sells=csps, close_csp_indices=close_indices)
 
