@@ -25,7 +25,7 @@ DEPTH_MULT = 11.0
 # Call buying: after most cash deployed, buy recovery upside
 CALL_DELTA = 0.50             # ATM calls
 CALL_DTE = 180                # 6 months — catch the recovery rally
-CALL_BUDGET_FRAC = 0.75       # Spend 75% of remaining cash on calls
+CALL_BUDGET_FRAC = 0.90       # Spend 90% of remaining cash on calls
 
 # ---------------------------------------------------------------------------
 # Helpers
