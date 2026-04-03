@@ -72,6 +72,10 @@ def decide_action(features, portfolio):
         elif secondary >= 1:
             spot_buy = cash * DEPLOY_2_SIGNALS
 
+        # If mostly deployed and small remainder, deploy all
+        if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
+            spot_buy = cash
+
     return Action(spot_buy_usd=spot_buy)
 
 # ---------------------------------------------------------------------------
