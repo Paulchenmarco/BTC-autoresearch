@@ -23,7 +23,7 @@ DEPTH_BASE = 0.10
 DEPTH_MULT = 12.0
 
 # Put selling
-CSP_SELL_ABOVE = 1.20         # Sell puts when MVRV > this (lower now — we can roll losses)
+CSP_SELL_ABOVE = 1.65         # Sell puts when MVRV > this
 CSP_DELTA = 0.14
 CSP_DTE = 14
 CSP_ALLOC = 0.95
@@ -56,6 +56,19 @@ def decide_action(features, portfolio):
     csps = []
     close_indices = []
 
+    # === ROLL defense: always check open puts regardless of MVRV ===
+    if len(portfolio.open_csps) > 0 and mvrv >= MVRV_THRESHOLD:
+        for idx, csp in enumerate(portfolio.open_csps):
+            current_val = reprice_csp(csp, features)
+            if current_val > csp.premium_usd * CSP_ROLL_TRIGGER:
+                # Roll down and out: close losing put, open lower strike + longer DTE
+                close_indices.append(idx)
+                csps.append(CSPOrder(
+                    delta=CSP_ROLL_DELTA,
+                    dte=CSP_ROLL_DTE,
+                    notional_usd=csp.notional,
+                ))
+
     if mvrv < MVRV_THRESHOLD:
         # === SPOT: deploy with depth scaling ===
         if cash < 10:
@@ -67,30 +80,14 @@ def decide_action(features, portfolio):
         if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
             spot_buy = cash
 
-    elif mvrv > CSP_SELL_ABOVE:
-        # === PUTS: sell or roll ===
-
-        if len(portfolio.open_csps) > 0:
-            # Check if any put needs rolling (moving against us)
-            for idx, csp in enumerate(portfolio.open_csps):
-                current_val = reprice_csp(csp, features)
-                if current_val > csp.premium_usd * CSP_ROLL_TRIGGER:
-                    # Put has moved against us — roll down and out
-                    close_indices.append(idx)
-                    # New put: lower delta (further OTM), longer DTE
-                    csps.append(CSPOrder(
-                        delta=CSP_ROLL_DELTA,
-                        dte=CSP_ROLL_DTE,
-                        notional_usd=csp.notional,  # same collateral
-                    ))
-        else:
-            # No open puts — sell new one
-            total_cash = cash
-            collateral = total_cash * CSP_ALLOC
-            if collateral > 100:
-                csps.append(CSPOrder(delta=CSP_DELTA, dte=CSP_DTE, notional_usd=collateral))
-
-    # Between MVRV_THRESHOLD and CSP_SELL_ABOVE: let open puts expire, no new ones
+    elif mvrv > CSP_SELL_ABOVE and len(portfolio.open_csps) - len(close_indices) == 0:
+        # === PUTS: sell new when no open positions ===
+        total_cash = cash
+        for idx in close_indices:
+            total_cash += portfolio.open_csps[idx].notional
+        collateral = total_cash * CSP_ALLOC
+        if collateral > 100:
+            csps.append(CSPOrder(delta=CSP_DELTA, dte=CSP_DTE, notional_usd=collateral))
 
     return Action(spot_buy_usd=spot_buy, csp_sells=csps, close_csp_indices=close_indices)
 
