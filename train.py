@@ -23,7 +23,7 @@ DEPTH_BASE = 0.10
 DEPTH_MULT = 12.0
 
 # Put selling
-CSP_SELL_ABOVE = 1.30         # Sell puts when MVRV > this (rolling protects lower entries)
+CSP_SELL_ABOVE = 0.95         # Sell puts when MVRV > this (rolling protects lower entries)
 CSP_DELTA = 0.14
 CSP_DTE = 14
 CSP_ALLOC = 0.95
