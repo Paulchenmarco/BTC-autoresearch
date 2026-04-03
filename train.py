@@ -23,7 +23,7 @@ DEPTH_BASE = 0.10
 DEPTH_MULT = 13.0
 
 # Put selling: only when MVRV is very high (early bear, far from crash)
-CSP_SELL_ABOVE = 1.50         # Sell puts only when MVRV > 1.50
+CSP_SELL_ABOVE = 1.80         # Sell puts only when MVRV > 1.80
 CSP_DELTA = 0.10
 CSP_DTE = 30
 CSP_ALLOC = 0.20              # 20% of cash
