@@ -10,7 +10,7 @@ import math
 from prepare import (
     load_features, construct_features, build_scenarios,
     run_backtest, score_results, print_results,
-    PortfolioState, Action, CSPOrder,
+    PortfolioState, Action, CSPOrder, reprice_csp,
 )
 
 # ---------------------------------------------------------------------------
@@ -22,11 +22,16 @@ MVRV_THRESHOLD = 0.80
 DEPTH_BASE = 0.10
 DEPTH_MULT = 12.0
 
-# Put selling: only when MVRV is very high (early bear, far from crash)
-CSP_SELL_ABOVE = 1.65         # Sell puts only when MVRV > 1.65
+# Put selling
+CSP_SELL_ABOVE = 1.20         # Sell puts when MVRV > this (lower now — we can roll losses)
 CSP_DELTA = 0.14
 CSP_DTE = 14
-CSP_ALLOC = 0.95              # 95% of cash
+CSP_ALLOC = 0.95
+
+# Roll parameters: when a put doubles in value (moving against us), roll down and out
+CSP_ROLL_TRIGGER = 2.0        # Roll when put value reaches 2x premium received
+CSP_ROLL_DELTA = 0.10         # Roll to a lower delta (further OTM)
+CSP_ROLL_DTE = 30             # Roll to longer DTE (more time value to offset cost)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,16 +50,16 @@ def _safe(val, default=0.0):
 
 def decide_action(features, portfolio):
     cash = portfolio.cash_available
-    if cash < 10:
-        return Action()
-
     mvrv = _safe(features.get("mvrv_ratio"), 1.0)
 
     spot_buy = 0.0
     csps = []
+    close_indices = []
 
     if mvrv < MVRV_THRESHOLD:
         # === SPOT: deploy with depth scaling ===
+        if cash < 10:
+            return Action()
         depth = (MVRV_THRESHOLD - mvrv) / MVRV_THRESHOLD
         frac = DEPTH_BASE + depth * DEPTH_MULT
         frac = min(frac, 1.0)
@@ -62,13 +67,32 @@ def decide_action(features, portfolio):
         if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
             spot_buy = cash
 
-    elif mvrv > CSP_SELL_ABOVE and len(portfolio.open_csps) == 0:
-        # === PUTS: sell only when very high MVRV, let expire naturally ===
-        collateral = cash * CSP_ALLOC
-        if collateral > 100:
-            csps.append(CSPOrder(delta=CSP_DELTA, dte=CSP_DTE, notional_usd=collateral))
+    elif mvrv > CSP_SELL_ABOVE:
+        # === PUTS: sell or roll ===
 
-    return Action(spot_buy_usd=spot_buy, csp_sells=csps)
+        if len(portfolio.open_csps) > 0:
+            # Check if any put needs rolling (moving against us)
+            for idx, csp in enumerate(portfolio.open_csps):
+                current_val = reprice_csp(csp, features)
+                if current_val > csp.premium_usd * CSP_ROLL_TRIGGER:
+                    # Put has moved against us — roll down and out
+                    close_indices.append(idx)
+                    # New put: lower delta (further OTM), longer DTE
+                    csps.append(CSPOrder(
+                        delta=CSP_ROLL_DELTA,
+                        dte=CSP_ROLL_DTE,
+                        notional_usd=csp.notional,  # same collateral
+                    ))
+        else:
+            # No open puts — sell new one
+            total_cash = cash
+            collateral = total_cash * CSP_ALLOC
+            if collateral > 100:
+                csps.append(CSPOrder(delta=CSP_DELTA, dte=CSP_DTE, notional_usd=collateral))
+
+    # Between MVRV_THRESHOLD and CSP_SELL_ABOVE: let open puts expire, no new ones
+
+    return Action(spot_buy_usd=spot_buy, csp_sells=csps, close_csp_indices=close_indices)
 
 # ---------------------------------------------------------------------------
 # Main
