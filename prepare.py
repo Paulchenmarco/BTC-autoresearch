@@ -209,10 +209,13 @@ def construct_features(df):
 
     # --- On-chain derived features (if available from dataset) ---
 
-    # MVRV Z-Score from MVRV ratio (if we have market cap and realized cap)
-    # For now, mvrv_ratio is directly from CoinMetrics CapMVRVCur
-    # Additional on-chain columns (nupl, sopr, puell_multiple, realized_price,
-    # sth_realized_price, mvrv_z_score) come from BGeometrics if fetched
+    # Use best available NUPL (BGeometrics if fetched, otherwise computed)
+    if "nupl" not in df.columns and "nupl_computed" in df.columns:
+        df["nupl"] = df["nupl_computed"]
+
+    # Use best available MVRV Z-Score
+    if "mvrv_z_score" not in df.columns and "mvrv_z_score_computed" in df.columns:
+        df["mvrv_z_score"] = df["mvrv_z_score_computed"]
 
     # Realized price ratio: close / realized_price
     if "realized_price" in df.columns:

@@ -159,6 +159,19 @@ def compute_derived(df):
         mvrv = df["mvrv_ratio"]
         df["realized_price_computed"] = df["close"] / mvrv.replace(0, np.nan)
 
+    # NUPL = 1 - (1/MVRV) = (MVRV - 1) / MVRV
+    if "mvrv_ratio" in df.columns:
+        mvrv = df["mvrv_ratio"].replace(0, np.nan)
+        df["nupl_computed"] = 1 - (1 / mvrv)
+
+    # MVRV Z-Score = (MarketCap - RealizedCap) / expanding_std(MarketCap - RealizedCap)
+    if "market_cap_usd" in df.columns and "mvrv_ratio" in df.columns:
+        mkt = df["market_cap_usd"]
+        mvrv = df["mvrv_ratio"].replace(0, np.nan)
+        real_cap = mkt / mvrv
+        diff = mkt - real_cap
+        df["mvrv_z_score_computed"] = diff / diff.expanding(min_periods=365).std()
+
     return df
 
 
