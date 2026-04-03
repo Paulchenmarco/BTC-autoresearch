@@ -79,7 +79,9 @@ def decide_action(features, portfolio):
     if buy_signal:
         # Scale up when price is below power law trend
         scale = 1.0
-        if pl_resid < -0.3:
+        if pl_resid < -0.4:
+            scale = 3.0
+        elif pl_resid < -0.2:
             scale = 2.0
         elif pl_resid < -0.1:
             scale = 1.5
