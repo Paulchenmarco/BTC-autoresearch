@@ -71,6 +71,7 @@ class CSPOrder:
 class Action:
     spot_buy_usd: float = 0.0
     csp_sells: list = field(default_factory=list)
+    close_csp_indices: list = field(default_factory=list)  # indices into portfolio.open_csps to close early
 
 
 @dataclass
@@ -92,6 +93,7 @@ class BacktestResult:
     num_csps_sold: int
     num_csps_assigned: int
     num_csps_expired_otm: int
+    num_csps_closed_early: int
 
 
 @dataclass
@@ -261,36 +263,77 @@ def construct_features(df):
 # ---------------------------------------------------------------------------
 
 def _delta_to_strike(delta, spot, iv, dte):
-    """Convert target delta to strike price using BS inverse."""
+    """Convert target put delta (absolute value, e.g. 0.15) to OTM strike price.
+
+    For a BS put with r=0: delta_put = N(d1) - 1 = -N(-d1)
+    So |delta_put| = N(-d1), meaning -d1 = norm.ppf(|delta|)
+    Solving for K: K = S * exp(d1 * sigma * sqrt(T) + 0.5 * sigma^2 * T)
+    where d1 = -norm.ppf(delta).
+    """
     if dte <= 0 or iv <= 0:
-        return spot * (1 - 0.1 * delta)
+        return spot * (1 - delta)
     T = dte / 365.0
     sqrt_T = math.sqrt(T)
-    # For a put, delta ~ -N(-d1). We want |delta| = target.
-    # Approximate: strike = spot * exp(-d1 * iv * sqrt(T) + 0.5 * iv^2 * T)
-    # Using quantile inversion:
-    z = norm.ppf(delta)  # negative for OTM puts
-    strike = spot * math.exp(-iv * sqrt_T * z - 0.5 * iv * iv * T)
-    return max(strike, spot * 0.5)  # floor at 50% OTM
+    # |put delta| = N(-d1), so -d1 = norm.ppf(delta), d1 = -norm.ppf(delta)
+    d1 = -norm.ppf(delta)
+    # From d1 = [ln(S/K) + 0.5*iv^2*T] / (iv*sqrt(T))
+    # => ln(K/S) = -d1 * iv * sqrt(T) + 0.5 * iv^2 * T
+    # But we want K < S for OTM put, so:
+    # K = S * exp(-d1 * iv * sqrt(T) + 0.5 * iv^2 * T)
+    # Wait, let me derive carefully:
+    # d1 = [ln(S/K) + 0.5*σ²T] / (σ√T)
+    # d1 * σ√T = ln(S/K) + 0.5*σ²T
+    # ln(S/K) = d1*σ√T - 0.5*σ²T
+    # ln(K/S) = -d1*σ√T + 0.5*σ²T
+    # K = S * exp(-d1*σ√T + 0.5*σ²T)
+    log_moneyness = -d1 * iv * sqrt_T + 0.5 * iv * iv * T
+    strike = spot * math.exp(log_moneyness)
+    # Ensure strike is OTM (below spot) and not absurdly far
+    strike = min(strike, spot * 0.99)  # cap at 1% OTM minimum
+    strike = max(strike, spot * 0.30)  # floor at 70% OTM
+    return strike
 
 
 def estimate_iv(features, delta, dte):
     """
     Estimate implied volatility for a BTC put option.
-    Uses realized vol as base with IV premium and smile adjustment.
+    Uses DVOL (Deribit vol index) when available, otherwise realized vol with premium.
+    Applies term structure and OTM skew adjustments.
     """
+    # Base ATM IV: prefer DVOL (actual market IV), fall back to realized vol
+    dvol = features.get("dvol")
     rv30 = features.get("realized_vol_30d", 0.60)
-    if rv30 is None or math.isnan(rv30):
+    if rv30 is None or (isinstance(rv30, float) and math.isnan(rv30)):
         rv30 = 0.60
 
-    # IV premium over realized vol (BTC typically 1.1-1.3x)
-    iv_premium = 1.20
+    if dvol is not None and isinstance(dvol, (int, float)) and not math.isnan(dvol) and dvol > 0:
+        # DVOL is annualized percentage, convert to decimal
+        atm_iv = dvol / 100.0
+    else:
+        # Fall back to realized vol with IV premium
+        atm_iv = rv30 * 1.15
 
-    # Smile adjustment: OTM puts have higher IV
-    smile_adj = 1.0 + 0.3 * max(0.50 - delta, 0)
+    # Term structure: DVOL is calibrated to 30-day.
+    # Short-dated (<30d): IV is typically higher (more gamma, event risk)
+    # Long-dated (>30d): IV is typically lower (mean reversion of vol)
+    if dte < 14:
+        term_adj = 1.10
+    elif dte < 30:
+        term_adj = 1.05
+    elif dte < 60:
+        term_adj = 1.00
+    else:
+        term_adj = 0.95  # long-dated vol slightly lower
 
-    base_iv = rv30 * iv_premium * smile_adj
-    return max(base_iv, 0.20)  # floor at 20%
+    # OTM put skew: BTC puts have significant skew
+    # 0.50 delta (ATM) = no adjustment
+    # 0.25 delta = ~5-10% higher IV
+    # 0.15 delta = ~10-20% higher IV
+    # 0.10 delta = ~15-25% higher IV
+    skew_adj = 1.0 + 0.4 * max(0.50 - delta, 0)
+
+    iv = atm_iv * term_adj * skew_adj
+    return max(iv, 0.15)  # floor at 15%
 
 
 def estimate_premium(csp_order, features):
@@ -328,6 +371,45 @@ def estimate_premium(csp_order, features):
     premium_usd *= (1 - DEFAULT_CSP_FEE)
 
     return max(premium_usd, 0.0), strike
+
+
+def reprice_csp(csp, features):
+    """
+    Reprice an open CSP at current market conditions.
+    Returns the current cost to buy back the put (in USD).
+    Used by the strategy to decide whether to take profit.
+    """
+    spot = features.get("close", 0)
+    if spot <= 0:
+        return csp.premium_usd  # can't reprice, assume no change
+
+    # Calculate remaining DTE
+    current_date = features.get("date")
+    if current_date is None:
+        return csp.premium_usd
+
+    if isinstance(current_date, datetime.date):
+        remaining_dte = (csp.expiry_date - current_date).days
+    else:
+        return csp.premium_usd
+
+    if remaining_dte <= 0:
+        # At or past expiry — value is intrinsic only
+        intrinsic = max(csp.strike - spot, 0)
+        return intrinsic * (csp.notional / csp.strike)
+
+    iv = estimate_iv(features, csp.delta_at_sale, remaining_dte)
+    T = remaining_dte / 365.0
+    sqrt_T = math.sqrt(T)
+
+    d1 = (math.log(spot / csp.strike) + 0.5 * iv * iv * T) / (iv * sqrt_T)
+    d2 = d1 - iv * sqrt_T
+    put_price = csp.strike * norm.cdf(-d2) - spot * norm.cdf(-d1)
+
+    num_contracts = csp.notional / csp.strike
+    current_value = put_price * num_contracts
+    return max(current_value, 0.0)
+
 
 # ---------------------------------------------------------------------------
 # Backtest engine
@@ -443,6 +525,7 @@ def run_backtest(strategy_fn, scenario, features_df):
         "csps_sold": 0,
         "csps_assigned": 0,
         "csps_expired_otm": 0,
+        "csps_closed_early": 0,
         "total_usd_deployed": 0.0,
     }
 
@@ -467,7 +550,22 @@ def run_backtest(strategy_fn, scenario, features_df):
         # 4. Validate
         action = _validate_action(action, portfolio)
 
-        # 5. Execute spot buy
+        # 5. Close CSPs early (take profit / cut loss — strategy decision)
+        if action.close_csp_indices:
+            # Sort descending so removal doesn't shift indices
+            for idx in sorted(action.close_csp_indices, reverse=True):
+                if 0 <= idx < len(portfolio.open_csps):
+                    csp = portfolio.open_csps[idx]
+                    # Cost to buy back = current market value of the put
+                    buyback_cost = reprice_csp(csp, features)
+                    # Pay buyback cost + fee
+                    buyback_cost *= (1 + DEFAULT_CSP_FEE)
+                    # Free collateral, deduct buyback cost
+                    portfolio.cash_reserved -= csp.notional
+                    portfolio.cash_available += csp.notional - buyback_cost
+                    portfolio.open_csps.pop(idx)
+                    stats["csps_closed_early"] += 1
+
         if action.spot_buy_usd > 0:
             btc_price = features["close"]
             if btc_price > 0:
@@ -477,7 +575,7 @@ def run_backtest(strategy_fn, scenario, features_df):
                 stats["spot_buys"] += 1
                 stats["total_usd_deployed"] += action.spot_buy_usd
 
-        # 6. Execute CSP sells
+        # 7. Execute CSP sells
         for csp_order in action.csp_sells:
             result = estimate_premium(csp_order, features)
             if isinstance(result, tuple):
@@ -527,6 +625,7 @@ def run_backtest(strategy_fn, scenario, features_df):
         num_csps_sold=stats["csps_sold"],
         num_csps_assigned=stats["csps_assigned"],
         num_csps_expired_otm=stats["csps_expired_otm"],
+        num_csps_closed_early=stats["csps_closed_early"],
     )
 
 # ---------------------------------------------------------------------------
@@ -597,5 +696,5 @@ def print_results(summary, scenarios, features_df):
                   f"premium: ${result.total_premium_earned:.2f}  "
                   f"spot_buys: {result.num_spot_buys}  "
                   f"csps: {result.num_csps_sold} "
-                  f"(assigned: {result.num_csps_assigned} otm: {result.num_csps_expired_otm})  "
+                  f"(assigned: {result.num_csps_assigned} otm: {result.num_csps_expired_otm} closed: {result.num_csps_closed_early})  "
                   f"| baseline lump: {lump:.6f}  dca: {dca:.6f}")
