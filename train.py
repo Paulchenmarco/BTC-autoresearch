@@ -23,7 +23,7 @@ SPOT_DEPLOY_FRACTION = 0.10     # Fraction of available cash per spot buy
 # CSP parameters
 CSP_DEPLOY_FRACTION = 0.50      # Fraction of idle cash to deploy as CSP collateral
 CSP_DEFAULT_DELTA = 0.15        # Default delta for put sells (lower = fewer assignments)
-CSP_DEFAULT_DTE = 30            # Default DTE
+CSP_DEFAULT_DTE = 45            # Default DTE (longer = more chance of OTM expiry)
 CSP_AGGRESSIVE_DELTA = 0.35     # Higher delta when deep in bear
 CSP_CONSERVATIVE_DELTA = 0.15   # Lower delta in high vol
 
