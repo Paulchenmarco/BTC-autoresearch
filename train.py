@@ -53,7 +53,7 @@ def decide_action(features, portfolio):
         # Scale deployment with MVRV depth: lower MVRV = more conviction
         # mvrv=0.80 → 30%, mvrv=0.70 → 50%, mvrv=0.60 → 70%
         depth = (MVRV_THRESHOLD - mvrv) / MVRV_THRESHOLD  # 0 to ~0.25
-        frac = 0.10 + depth * 12.0  # 0.10 to ~1.0
+        frac = 0.10 + depth * 11.0  # 0.10 to ~1.0
         frac = min(frac, 1.0)
         spot_buy = cash * frac
 
