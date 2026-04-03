@@ -10,20 +10,22 @@ import math
 from prepare import (
     load_features, construct_features, build_scenarios,
     run_backtest, score_results, print_results,
-    PortfolioState, Action, CSPOrder,
+    PortfolioState, Action, CallBuyOrder,
 )
 
 # ---------------------------------------------------------------------------
 # Strategy parameters (edit these)
 # ---------------------------------------------------------------------------
 
-# Gate: MVRV must be below this to buy
+# MVRV gate and depth scaling
 MVRV_THRESHOLD = 0.80
+DEPTH_BASE = 0.10
+DEPTH_MULT = 11.0
 
-# Sizing: deploy more when volatility is elevated (panic selling = better prices)
-RV30_THRESHOLD = 0.70
-DEPLOY_HIGH_CONVICTION = 0.50   # MVRV < threshold AND rv30 > threshold
-DEPLOY_LOW_CONVICTION = 0.30    # MVRV < threshold AND rv30 <= threshold
+# Call buying: after most cash deployed, buy recovery upside
+CALL_DELTA = 0.40             # Slightly OTM calls
+CALL_DTE = 180                # 6 months — catch the recovery rally
+CALL_BUDGET_FRAC = 0.50       # Spend 50% of remaining cash on calls
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,22 +48,32 @@ def decide_action(features, portfolio):
         return Action()
 
     mvrv = _safe(features.get("mvrv_ratio"), 1.0)
-    rv30 = _safe(features.get("realized_vol_30d"), 0.40)
 
     spot_buy = 0.0
+    calls = []
+
+    # --- SPOT: MVRV depth scaling ---
     if mvrv < MVRV_THRESHOLD:
-        # Scale deployment with MVRV depth: lower MVRV = more conviction
-        # mvrv=0.80 → 30%, mvrv=0.70 → 50%, mvrv=0.60 → 70%
-        depth = (MVRV_THRESHOLD - mvrv) / MVRV_THRESHOLD  # 0 to ~0.25
-        frac = 0.10 + depth * 11.0  # 0.10 to ~1.0
+        depth = (MVRV_THRESHOLD - mvrv) / MVRV_THRESHOLD
+        frac = DEPTH_BASE + depth * DEPTH_MULT
         frac = min(frac, 1.0)
         spot_buy = cash * frac
-
-        # Deploy all remainder when small
         if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
             spot_buy = cash
 
-    return Action(spot_buy_usd=spot_buy)
+    # --- CALLS: after deployment, buy recovery calls with leftover cash ---
+    remaining = cash - spot_buy
+    if (portfolio.btc_held > 0 and remaining > 200 and remaining < 5000
+            and len(portfolio.open_calls) == 0):
+        call_budget = remaining * CALL_BUDGET_FRAC
+        if call_budget > 50:
+            calls.append(CallBuyOrder(
+                delta=CALL_DELTA,
+                dte=CALL_DTE,
+                premium_budget=call_budget,
+            ))
+
+    return Action(spot_buy_usd=spot_buy, call_buys=calls)
 
 # ---------------------------------------------------------------------------
 # Main
