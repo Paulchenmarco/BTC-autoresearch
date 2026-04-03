@@ -205,13 +205,51 @@ def construct_features(df):
     predicted_log_p = slope * log_d + intercept
     df["power_law_residual"] = log_p - predicted_log_p
 
-    # Percentile ranks (backward-looking)
-    for col in ["mayer_multiple", "realized_vol_30d", "distance_from_ath", "power_law_residual"]:
+    # --- On-chain derived features (if available from dataset) ---
+
+    # MVRV Z-Score from MVRV ratio (if we have market cap and realized cap)
+    # For now, mvrv_ratio is directly from CoinMetrics CapMVRVCur
+    # Additional on-chain columns (nupl, sopr, puell_multiple, realized_price,
+    # sth_realized_price, mvrv_z_score) come from BGeometrics if fetched
+
+    # Realized price ratio: close / realized_price
+    if "realized_price" in df.columns:
+        rp = df["realized_price"].astype(float)
+        df["realized_price_ratio"] = close / rp.replace(0, np.nan)
+    elif "realized_price_computed" in df.columns:
+        rp = df["realized_price_computed"].astype(float)
+        df["realized_price_ratio"] = close / rp.replace(0, np.nan)
+
+    # STH realized price ratio
+    if "sth_realized_price" in df.columns:
+        sth_rp = df["sth_realized_price"].astype(float)
+        df["sth_rp_ratio"] = close / sth_rp.replace(0, np.nan)
+
+    # Use best available Puell Multiple
+    if "puell_multiple" not in df.columns and "puell_multiple_computed" in df.columns:
+        df["puell_multiple"] = df["puell_multiple_computed"]
+
+    # Funding rate features (if available)
+    if "funding_rate" in df.columns:
+        fr = df["funding_rate"].astype(float)
+        df["funding_rate_7d_avg"] = fr.rolling(7, min_periods=1).mean()
+        df["funding_rate_30d_avg"] = fr.rolling(30, min_periods=7).mean()
+
+    # DVOL features (if available)
+    if "dvol" in df.columns:
+        dvol = df["dvol"].astype(float)
+        df["dvol_pct_90d"] = dvol.rolling(90, min_periods=30).rank(pct=True)
+
+    # --- Percentile ranks (backward-looking) ---
+    pct_cols = ["mayer_multiple", "realized_vol_30d", "distance_from_ath",
+                "power_law_residual", "mvrv_ratio", "nupl", "sopr", "puell_multiple"]
+    for col in pct_cols:
         if col in df.columns:
             df[f"{col}_pct_365d"] = df[col].rolling(365, min_periods=90).rank(pct=True)
 
-    # Slopes
-    for col in ["mayer_multiple", "distance_from_ath"]:
+    # --- Slopes ---
+    slope_cols = ["mayer_multiple", "distance_from_ath", "mvrv_ratio", "nupl"]
+    for col in slope_cols:
         if col in df.columns:
             df[f"{col}_slope_7d"] = _rolling_slope(df[col], 7)
             df[f"{col}_slope_30d"] = _rolling_slope(df[col], 30)
