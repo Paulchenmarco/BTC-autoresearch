@@ -50,10 +50,12 @@ def decide_action(features, portfolio):
 
     spot_buy = 0.0
     if mvrv < MVRV_THRESHOLD:
-        if rv30 > RV30_THRESHOLD:
-            spot_buy = cash * DEPLOY_HIGH_CONVICTION
-        else:
-            spot_buy = cash * DEPLOY_LOW_CONVICTION
+        # Scale deployment with MVRV depth: lower MVRV = more conviction
+        # mvrv=0.80 → 30%, mvrv=0.70 → 50%, mvrv=0.60 → 70%
+        depth = (MVRV_THRESHOLD - mvrv) / MVRV_THRESHOLD  # 0 to ~0.25
+        frac = 0.30 + depth * 8.0  # 0.30 to ~0.70
+        frac = min(frac, 0.70)
+        spot_buy = cash * frac
 
         # Deploy all remainder when small
         if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
