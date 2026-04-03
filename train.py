@@ -104,19 +104,8 @@ def decide_action(features, portfolio):
                         scale *= 1.5
         spot_buy = cash * SPOT_DEPLOY_FRACTION * scale
 
-    # --- CSP logic: keep idle cash productive ---
-    remaining = cash - spot_buy
-    if remaining > 100 and len(portfolio.open_csps) == 0:
-        delta = CSP_DEFAULT_DELTA
-        csp_notional = remaining * CSP_DEPLOY_FRACTION
-        if csp_notional > 100:
-            csps.append(CSPOrder(
-                delta=delta,
-                dte=CSP_DEFAULT_DTE,
-                notional_usd=csp_notional,
-            ))
-
-    return Action(spot_buy_usd=spot_buy, csp_sells=csps)
+    # CSPs disabled — optimizing spot deployment first
+    return Action(spot_buy_usd=spot_buy)
 
 # ---------------------------------------------------------------------------
 # Main: run all scenarios and print results
