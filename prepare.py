@@ -50,6 +50,30 @@ class OpenCSP:
 
 
 @dataclass
+class OpenPutSpread:
+    """Bull put spread: sell put at short_strike, buy put at long_strike (lower)."""
+    sell_date: datetime.date
+    expiry_date: datetime.date
+    short_strike: float     # higher strike (sold)
+    long_strike: float      # lower strike (bought)
+    max_loss: float         # (short_strike - long_strike) * contracts - net premium
+    collateral: float       # cash reserved = max_loss
+    net_premium_usd: float  # premium received - premium paid
+    short_delta: float
+
+
+@dataclass
+class OpenCallBuy:
+    """Long call option position."""
+    buy_date: datetime.date
+    expiry_date: datetime.date
+    strike: float
+    premium_paid: float
+    delta_at_buy: float
+    num_contracts_btc: float  # number of BTC-denominated contracts
+
+
+@dataclass
 class PortfolioState:
     date: datetime.date
     cash_available: float
@@ -57,7 +81,9 @@ class PortfolioState:
     btc_held: float
     total_premium_earned: float
     open_csps: list
-    day_index: int
+    open_spreads: list = field(default_factory=list)
+    open_calls: list = field(default_factory=list)
+    day_index: int = 0
 
 
 @dataclass
@@ -68,10 +94,30 @@ class CSPOrder:
 
 
 @dataclass
+class PutSpreadOrder:
+    """Bull put spread order."""
+    short_delta: float      # delta of the put we sell (e.g. 0.20)
+    long_delta: float       # delta of the put we buy (e.g. 0.10, further OTM)
+    dte: int
+    num_spreads_usd: float  # dollar amount controlling spread sizing
+
+
+@dataclass
+class CallBuyOrder:
+    """Buy a call option."""
+    delta: float            # target delta (e.g. 0.30 for OTM call)
+    dte: int
+    premium_budget: float   # max USD to spend on call premium
+
+
+@dataclass
 class Action:
     spot_buy_usd: float = 0.0
     csp_sells: list = field(default_factory=list)
-    close_csp_indices: list = field(default_factory=list)  # indices into portfolio.open_csps to close early
+    spread_sells: list = field(default_factory=list)
+    call_buys: list = field(default_factory=list)
+    close_csp_indices: list = field(default_factory=list)
+    close_spread_indices: list = field(default_factory=list)
 
 
 @dataclass
@@ -94,6 +140,13 @@ class BacktestResult:
     num_csps_assigned: int
     num_csps_expired_otm: int
     num_csps_closed_early: int
+    num_spreads_sold: int = 0
+    num_spreads_assigned: int = 0
+    num_spreads_expired_otm: int = 0
+    num_calls_bought: int = 0
+    num_calls_itm: int = 0
+    num_calls_expired_otm: int = 0
+    call_profit_usd: float = 0.0
 
 
 @dataclass
@@ -376,6 +429,100 @@ def estimate_premium(csp_order, features):
     return max(premium_usd, 0.0), strike
 
 
+def _bs_put_price(spot, strike, iv, T):
+    """Black-Scholes put price with r=0."""
+    if T <= 0 or iv <= 0 or spot <= 0 or strike <= 0:
+        return max(strike - spot, 0) if spot > 0 and strike > 0 else 0.0
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(spot / strike) + 0.5 * iv * iv * T) / (iv * sqrt_T)
+    d2 = d1 - iv * sqrt_T
+    return strike * norm.cdf(-d2) - spot * norm.cdf(-d1)
+
+
+def _bs_call_price(spot, strike, iv, T):
+    """Black-Scholes call price with r=0."""
+    if T <= 0 or iv <= 0 or spot <= 0 or strike <= 0:
+        return max(spot - strike, 0) if spot > 0 and strike > 0 else 0.0
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(spot / strike) + 0.5 * iv * iv * T) / (iv * sqrt_T)
+    d2 = d1 - iv * sqrt_T
+    return spot * norm.cdf(d1) - strike * norm.cdf(d2)
+
+
+def _delta_to_call_strike(delta, spot, iv, dte):
+    """Convert target call delta (e.g. 0.30) to OTM call strike (above spot)."""
+    if dte <= 0 or iv <= 0:
+        return spot * (1 + delta)
+    T = dte / 365.0
+    sqrt_T = math.sqrt(T)
+    # For a call: delta = N(d1), so d1 = norm.ppf(delta)
+    d1 = norm.ppf(delta)
+    log_moneyness = -d1 * iv * sqrt_T + 0.5 * iv * iv * T
+    strike = spot * math.exp(log_moneyness)
+    strike = max(strike, spot * 1.01)  # at least 1% OTM
+    strike = min(strike, spot * 3.0)   # cap at 3x spot
+    return strike
+
+
+def estimate_call_premium(order, features):
+    """Estimate call option premium. Returns (premium_usd, strike)."""
+    spot = features.get("close", 0)
+    if spot <= 0 or order.dte <= 0:
+        return 0.0, spot
+
+    # Use call delta for IV (calls have less skew than puts)
+    iv = estimate_iv(features, 0.50, order.dte)  # ATM IV as base
+    # Calls have less skew — slight reduction for OTM calls
+    call_skew = 1.0 - 0.1 * max(0.50 - order.delta, 0)
+    iv *= call_skew
+
+    T = order.dte / 365.0
+    strike = _delta_to_call_strike(order.delta, spot, iv, order.dte)
+    call_price = _bs_call_price(spot, strike, iv, T)
+
+    # For BTC options on Deribit, 1 contract = 1 BTC
+    # premium_budget buys premium_budget / (call_price * spot_in_usd) contracts
+    # But call_price is in USD per 1 BTC notional
+    premium_per_contract = call_price  # USD per 1 BTC contract
+    if premium_per_contract <= 0:
+        return 0.0, strike
+
+    premium_per_contract *= (1 + DEFAULT_CSP_FEE)  # buyer pays fee
+    return premium_per_contract, strike
+
+
+def estimate_spread_premium(order, features):
+    """Estimate bull put spread net premium. Returns (net_premium, short_strike, long_strike)."""
+    spot = features.get("close", 0)
+    if spot <= 0 or order.dte <= 0:
+        return 0.0, spot, spot
+
+    T = order.dte / 365.0
+
+    # Price the short put (higher strike, we sell)
+    iv_short = estimate_iv(features, order.short_delta, order.dte)
+    short_strike = _delta_to_strike(order.short_delta, spot, iv_short, order.dte)
+    short_put_price = _bs_put_price(spot, short_strike, iv_short, T)
+
+    # Price the long put (lower strike, we buy)
+    iv_long = estimate_iv(features, order.long_delta, order.dte)
+    long_strike = _delta_to_strike(order.long_delta, spot, iv_long, order.dte)
+    long_put_price = _bs_put_price(spot, long_strike, iv_long, T)
+
+    # Ensure short strike > long strike
+    if short_strike <= long_strike:
+        return 0.0, short_strike, long_strike
+
+    # Net premium = premium received - premium paid
+    net_premium = short_put_price - long_put_price
+    # Scale to notional
+    num_contracts = order.num_spreads_usd / (short_strike - long_strike)
+    net_premium_usd = net_premium * num_contracts
+    net_premium_usd *= (1 - DEFAULT_CSP_FEE)  # net of fees
+
+    return max(net_premium_usd, 0.0), short_strike, long_strike
+
+
 def reprice_csp(csp, features):
     """
     Reprice an open CSP at current market conditions.
@@ -458,6 +605,81 @@ def _settle_expired_csps(portfolio, date, features_df, stats):
     portfolio.open_csps = still_open
 
 
+def _settle_expired_spreads(portfolio, date, features_df, stats):
+    """Settle expired bull put spreads."""
+    still_open = []
+    for spread in portfolio.open_spreads:
+        if date >= spread.expiry_date:
+            expiry_rows = [r for r in features_df if r["date"] == spread.expiry_date]
+            if not expiry_rows:
+                prior = [r for r in features_df if r["date"] <= spread.expiry_date]
+                if prior:
+                    expiry_rows = [prior[-1]]
+                else:
+                    portfolio.cash_available += spread.collateral
+                    portfolio.cash_reserved -= spread.collateral
+                    stats["spreads_expired_otm"] += 1
+                    continue
+
+            spot = expiry_rows[0]["close"]
+            portfolio.cash_reserved -= spread.collateral
+
+            if spot >= spread.short_strike:
+                # Both OTM: keep full collateral + premium already credited
+                portfolio.cash_available += spread.collateral
+                stats["spreads_expired_otm"] += 1
+            elif spot <= spread.long_strike:
+                # Both ITM: max loss. Collateral covers it. Buy BTC with whatever remains.
+                # Loss = (short_strike - long_strike) * contracts
+                # But collateral = max_loss, so no cash returned from spread itself
+                # Buy BTC with the net (collateral was already reserved from max_loss)
+                stats["spreads_assigned"] += 1
+            else:
+                # Partial loss: spot between strikes
+                loss_per_btc = spread.short_strike - spot
+                spread_width = spread.short_strike - spread.long_strike
+                loss_frac = loss_per_btc / spread_width
+                actual_loss = spread.collateral * loss_frac
+                returned = spread.collateral - actual_loss
+                portfolio.cash_available += returned
+                stats["spreads_assigned"] += 1
+        else:
+            still_open.append(spread)
+    portfolio.open_spreads = still_open
+
+
+def _settle_expired_calls(portfolio, date, features_df, stats):
+    """Settle expired call options. If ITM, convert profit to BTC."""
+    still_open = []
+    for call in portfolio.open_calls:
+        if date >= call.expiry_date:
+            expiry_rows = [r for r in features_df if r["date"] == call.expiry_date]
+            if not expiry_rows:
+                prior = [r for r in features_df if r["date"] <= call.expiry_date]
+                if prior:
+                    expiry_rows = [prior[-1]]
+                else:
+                    stats["calls_expired_otm"] += 1
+                    continue
+
+            spot = expiry_rows[0]["close"]
+
+            if spot > call.strike:
+                # ITM: profit = (spot - strike) * num_contracts
+                profit_usd = (spot - call.strike) * call.num_contracts_btc
+                # Convert profit to BTC (buy-only philosophy)
+                btc_from_calls = (profit_usd * (1 - DEFAULT_SPOT_FEE)) / spot
+                portfolio.btc_held += btc_from_calls
+                stats["calls_itm"] += 1
+                stats["call_profit_usd"] += profit_usd
+            else:
+                # OTM: call expires worthless, premium already paid
+                stats["calls_expired_otm"] += 1
+        else:
+            still_open.append(call)
+    portfolio.open_calls = still_open
+
+
 def _validate_action(action, portfolio):
     """Validate and clamp action to enforce buy-only and cash constraints."""
     available = portfolio.cash_available
@@ -481,7 +703,10 @@ def _validate_action(action, portfolio):
         valid_csps.append(CSPOrder(delta=delta, dte=dte, notional_usd=notional))
         remaining -= notional
 
-    return Action(spot_buy_usd=spot, csp_sells=valid_csps)
+    return Action(spot_buy_usd=spot, csp_sells=valid_csps,
+                  spread_sells=action.spread_sells, call_buys=action.call_buys,
+                  close_csp_indices=action.close_csp_indices,
+                  close_spread_indices=action.close_spread_indices)
 
 
 def run_backtest(strategy_fn, scenario, features_df):
@@ -529,6 +754,13 @@ def run_backtest(strategy_fn, scenario, features_df):
         "csps_assigned": 0,
         "csps_expired_otm": 0,
         "csps_closed_early": 0,
+        "spreads_sold": 0,
+        "spreads_assigned": 0,
+        "spreads_expired_otm": 0,
+        "calls_bought": 0,
+        "calls_itm": 0,
+        "calls_expired_otm": 0,
+        "call_profit_usd": 0.0,
         "total_usd_deployed": 0.0,
     }
 
@@ -536,8 +768,10 @@ def run_backtest(strategy_fn, scenario, features_df):
         portfolio.date = date
         portfolio.day_index = i
 
-        # 1. Settle expired CSPs
+        # 1. Settle expired positions
         _settle_expired_csps(portfolio, date, all_feature_records, stats)
+        _settle_expired_spreads(portfolio, date, all_feature_records, stats)
+        _settle_expired_calls(portfolio, date, all_feature_records, stats)
 
         # 2. Get features (no lookahead — only data up to this date)
         features = feature_lookup.get(date)
@@ -606,9 +840,63 @@ def run_backtest(strategy_fn, scenario, features_df):
             portfolio.total_premium_earned += premium
             stats["csps_sold"] += 1
 
-    # Force-settle remaining CSPs at scenario end
-    _settle_expired_csps(portfolio, scenario.end_date + datetime.timedelta(days=365),
-                         all_feature_records, stats)
+        # 8. Execute put spread sells
+        for spread_order in action.spread_sells:
+            result = estimate_spread_premium(spread_order, features)
+            if not isinstance(result, tuple) or len(result) != 3:
+                continue
+            net_premium, short_strike, long_strike = result
+            if net_premium <= 0 or short_strike <= long_strike:
+                continue
+
+            spread_width = short_strike - long_strike
+            num_contracts = spread_order.num_spreads_usd / spread_width
+            max_loss = spread_width * num_contracts - net_premium
+            max_loss = max(max_loss, 0)
+
+            if max_loss > portfolio.cash_available:
+                continue
+
+            expiry = date + datetime.timedelta(days=spread_order.dte)
+            portfolio.open_spreads.append(OpenPutSpread(
+                sell_date=date, expiry_date=expiry,
+                short_strike=short_strike, long_strike=long_strike,
+                max_loss=max_loss, collateral=max_loss,
+                net_premium_usd=net_premium, short_delta=spread_order.short_delta,
+            ))
+            portfolio.cash_reserved += max_loss
+            portfolio.cash_available -= max_loss
+            portfolio.cash_available += net_premium
+            portfolio.total_premium_earned += net_premium
+            stats["spreads_sold"] += 1
+
+        # 9. Execute call buys
+        for call_order in action.call_buys:
+            result = estimate_call_premium(call_order, features)
+            if not isinstance(result, tuple):
+                continue
+            premium_per_contract, strike = result
+            if premium_per_contract <= 0 or call_order.premium_budget <= 0:
+                continue
+
+            budget = min(call_order.premium_budget, portfolio.cash_available)
+            if budget < MIN_TRADE_USD:
+                continue
+
+            num_contracts = budget / premium_per_contract
+            portfolio.open_calls.append(OpenCallBuy(
+                buy_date=date, expiry_date=date + datetime.timedelta(days=call_order.dte),
+                strike=strike, premium_paid=budget,
+                delta_at_buy=call_order.delta, num_contracts_btc=num_contracts,
+            ))
+            portfolio.cash_available -= budget
+            stats["calls_bought"] += 1
+
+    # Force-settle remaining positions at scenario end
+    far_future = scenario.end_date + datetime.timedelta(days=365)
+    _settle_expired_csps(portfolio, far_future, all_feature_records, stats)
+    _settle_expired_spreads(portfolio, far_future, all_feature_records, stats)
+    _settle_expired_calls(portfolio, far_future, all_feature_records, stats)
 
     # Any remaining reserved cash becomes available (safety)
     portfolio.cash_available += portfolio.cash_reserved
@@ -629,6 +917,13 @@ def run_backtest(strategy_fn, scenario, features_df):
         num_csps_assigned=stats["csps_assigned"],
         num_csps_expired_otm=stats["csps_expired_otm"],
         num_csps_closed_early=stats["csps_closed_early"],
+        num_spreads_sold=stats["spreads_sold"],
+        num_spreads_assigned=stats["spreads_assigned"],
+        num_spreads_expired_otm=stats["spreads_expired_otm"],
+        num_calls_bought=stats["calls_bought"],
+        num_calls_itm=stats["calls_itm"],
+        num_calls_expired_otm=stats["calls_expired_otm"],
+        call_profit_usd=stats["call_profit_usd"],
     )
 
 # ---------------------------------------------------------------------------
@@ -693,11 +988,18 @@ def print_results(summary, scenarios, features_df):
         if result:
             lump = _run_naive_lump_sum(scenario, features_df)
             dca = _run_naive_dca(scenario, features_df)
+            opts = (f"csps: {result.num_csps_sold} "
+                   f"(a:{result.num_csps_assigned} o:{result.num_csps_expired_otm} c:{result.num_csps_closed_early})")
+            if result.num_spreads_sold > 0:
+                opts += (f"  spreads: {result.num_spreads_sold} "
+                        f"(a:{result.num_spreads_assigned} o:{result.num_spreads_expired_otm})")
+            if result.num_calls_bought > 0:
+                opts += (f"  calls: {result.num_calls_bought} "
+                        f"(itm:{result.num_calls_itm} otm:{result.num_calls_expired_otm} "
+                        f"profit:${result.call_profit_usd:.0f})")
             print(f"scenario: {result.scenario_name:20s}  "
                   f"terminal_btc: {result.terminal_btc:.6f}  "
-                  f"btc_per_usd: {result.btc_per_usd:.10f}  "
                   f"premium: ${result.total_premium_earned:.2f}  "
                   f"spot_buys: {result.num_spot_buys}  "
-                  f"csps: {result.num_csps_sold} "
-                  f"(assigned: {result.num_csps_assigned} otm: {result.num_csps_expired_otm} closed: {result.num_csps_closed_early})  "
+                  f"{opts}  "
                   f"| baseline lump: {lump:.6f}  dca: {dca:.6f}")
