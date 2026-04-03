@@ -5,6 +5,8 @@ This is the ONLY file the autoresearch loop modifies.
 Usage: python train.py
 """
 
+import math
+
 from prepare import (
     load_features, construct_features, build_scenarios,
     run_backtest, score_results, print_results,
@@ -15,100 +17,66 @@ from prepare import (
 # Strategy parameters (edit these)
 # ---------------------------------------------------------------------------
 
-# Spot buy triggers
-MAYER_BUY_THRESHOLD = 0.8       # Buy spot when Mayer Multiple < this
-DISTANCE_ATH_THRESHOLD = 0.60   # Buy spot when >60% below ATH
-SPOT_DEPLOY_FRACTION = 0.08     # Fraction of available cash per spot buy
+# Conviction thresholds — when these align, deploy heavily
+MVRV_THRESHOLD = 0.80
+DIST_ATH_THRESHOLD = 0.75
+PL_RESID_THRESHOLD = -0.40
+RV30_THRESHOLD = 0.70
 
-# CSP parameters
-CSP_DEPLOY_FRACTION = 0.05      # Fraction of idle cash to deploy as CSP collateral
-CSP_DEFAULT_DELTA = 0.15        # Default delta for put sells (lower = fewer assignments)
-CSP_DEFAULT_DTE = 90            # Default DTE (max allowed)
-CSP_AGGRESSIVE_DELTA = 0.35     # Higher delta when deep in bear
-CSP_CONSERVATIVE_DELTA = 0.15   # Lower delta in high vol
+# Deployment sizing by conviction level
+DEPLOY_4_SIGNALS = 0.50     # 4/4 signals: deploy 50% of cash
+DEPLOY_3_SIGNALS = 0.30     # 3/4 signals: deploy 30%
+DEPLOY_2_SIGNALS = 0.15     # 2/4 signals: deploy 15%
 
-# Volatility thresholds
-VOL_HIGH_THRESHOLD = 0.90       # RV30 above this = high vol
-VOL_LOW_THRESHOLD = 0.50        # RV30 below this = low vol
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _safe(val, default=0.0):
+    if val is None:
+        return default
+    if isinstance(val, float) and math.isnan(val):
+        return default
+    return float(val)
 
 # ---------------------------------------------------------------------------
 # Strategy logic
 # ---------------------------------------------------------------------------
 
 def decide_action(features, portfolio):
-    """
-    Core strategy function. Called once per day by the backtest engine.
-
-    Args:
-        features: dict of feature values for current date
-        portfolio: PortfolioState with current holdings
-
-    Returns:
-        Action with spot_buy_usd and csp_sells
-    """
     cash = portfolio.cash_available
     if cash < 10:
         return Action()
 
-    mayer = features.get("mayer_multiple")
-    rv30 = features.get("realized_vol_30d")
-    dist_ath = features.get("distance_from_ath")
+    mvrv = _safe(features.get("mvrv_ratio"), 1.0)
+    dist_ath = _safe(features.get("distance_from_ath"), 0.0)
+    pl_resid = _safe(features.get("power_law_residual"), 0.0)
+    rv30 = _safe(features.get("realized_vol_30d"), 0.40)
 
-    # Handle NaN features (early dates before rolling windows fill)
-    if mayer is None or (isinstance(mayer, float) and mayer != mayer):
-        mayer = 1.0
-    if rv30 is None or (isinstance(rv30, float) and rv30 != rv30):
-        rv30 = 0.60
-    if dist_ath is None or (isinstance(dist_ath, float) and dist_ath != dist_ath):
-        dist_ath = 0.0
+    # Count conviction signals
+    signals = 0
+    if mvrv < MVRV_THRESHOLD:
+        signals += 1
+    if dist_ath > DIST_ATH_THRESHOLD:
+        signals += 1
+    if pl_resid < PL_RESID_THRESHOLD:
+        signals += 1
+    if rv30 > RV30_THRESHOLD:
+        signals += 1
 
+    # Deploy based on conviction
     spot_buy = 0.0
-    csps = []
+    if signals >= 4:
+        spot_buy = cash * DEPLOY_4_SIGNALS
+    elif signals >= 3:
+        spot_buy = cash * DEPLOY_3_SIGNALS
+    elif signals >= 2:
+        spot_buy = cash * DEPLOY_2_SIGNALS
 
-    # --- Spot buy logic: use power law residual and 7d return for scaling ---
-    pl_resid = features.get("power_law_residual")
-    if pl_resid is None or (isinstance(pl_resid, float) and pl_resid != pl_resid):
-        pl_resid = 0.0
-    ret_7d = features.get("return_7d")
-    if ret_7d is None or (isinstance(ret_7d, float) and ret_7d != ret_7d):
-        ret_7d = 0.0
-
-    mvrv = features.get("mvrv_ratio")
-    if mvrv is None or (isinstance(mvrv, float) and mvrv != mvrv):
-        mvrv = 1.0
-
-    # Gate: don't start buying until MVRV < 0.80
-    buy_signal = False
-    if mvrv < 0.80 and (mayer < MAYER_BUY_THRESHOLD or dist_ath > DISTANCE_ATH_THRESHOLD):
-        buy_signal = True
-
-    if buy_signal:
-        # Scale up when price is below power law trend
-        scale = 1.0
-        if pl_resid < -0.4:
-            scale = 3.0
-        elif pl_resid < -0.2:
-            scale = 2.0
-        elif pl_resid < -0.1:
-            scale = 1.5
-        # Buy more after sharp drops (mean reversion opportunity)
-        if ret_7d < -0.20:
-            scale *= 1.5
-        # Buy more when hash ribbon is in recovery (miner capitulation ending)
-        hr_signal = features.get("hash_ribbon_signal")
-        hr_ratio = features.get("hash_ribbon_ratio")
-        if hr_signal is not None and hr_ratio is not None:
-            if not (isinstance(hr_signal, float) and hr_signal != hr_signal):
-                if hr_signal == 1.0 and isinstance(hr_ratio, float) and not (hr_ratio != hr_ratio):
-                    if hr_ratio < 1.05:  # Just crossed above — early recovery
-                        scale *= 1.5
-        spot_buy = cash * SPOT_DEPLOY_FRACTION * scale
-
-    # CSPs disabled — optimizing spot deployment first
     return Action(spot_buy_usd=spot_buy)
 
 # ---------------------------------------------------------------------------
-# Main: run all scenarios and print results
+# Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
