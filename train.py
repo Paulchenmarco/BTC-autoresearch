@@ -99,13 +99,7 @@ def decide_action(features, portfolio):
     # --- CSP logic: keep idle cash productive ---
     remaining = cash - spot_buy
     if remaining > 100 and len(portfolio.open_csps) == 0:
-        # Select delta based on vol regime
         delta = CSP_DEFAULT_DELTA
-        if rv30 > VOL_HIGH_THRESHOLD:
-            delta = CSP_CONSERVATIVE_DELTA
-        elif dist_ath > 0.70:
-            delta = CSP_AGGRESSIVE_DELTA
-
         csp_notional = remaining * CSP_DEPLOY_FRACTION
         if csp_notional > 100:
             csps.append(CSPOrder(
