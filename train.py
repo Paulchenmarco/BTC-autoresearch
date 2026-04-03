@@ -24,8 +24,8 @@ PL_RESID_THRESHOLD = -0.40
 RV30_THRESHOLD = 0.70
 
 # Deployment sizing: MVRV required + secondary signal count
-DEPLOY_4_SIGNALS = 0.60     # MVRV + 3/3 secondary: deploy 60%
-DEPLOY_3_SIGNALS = 0.35     # MVRV + 2/3 secondary: deploy 35%
+DEPLOY_4_SIGNALS = 0.50     # MVRV + 3/3 secondary: deploy 50%
+DEPLOY_3_SIGNALS = 0.30     # MVRV + 2/3 secondary: deploy 30%
 DEPLOY_2_SIGNALS = 0.15     # MVRV + 1/3 secondary: deploy 15%
 
 # ---------------------------------------------------------------------------
