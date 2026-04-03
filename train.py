@@ -92,7 +92,7 @@ def decide_action(features, portfolio):
         elif pl_resid < -0.1:
             scale = 1.5
         # Buy more after sharp drops (mean reversion opportunity)
-        if ret_7d < -0.15:
+        if ret_7d < -0.20:
             scale *= 1.5
         # Buy more when hash ribbon is in recovery (miner capitulation ending)
         hr_signal = features.get("hash_ribbon_signal")
