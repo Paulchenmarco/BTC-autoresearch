@@ -73,10 +73,13 @@ def decide_action(features, portfolio):
     if ret_7d is None or (isinstance(ret_7d, float) and ret_7d != ret_7d):
         ret_7d = 0.0
 
+    mvrv = features.get("mvrv_ratio")
+    if mvrv is None or (isinstance(mvrv, float) and mvrv != mvrv):
+        mvrv = 1.0
+
+    # Gate: don't start buying until MVRV < 0.85 (market below realized value territory)
     buy_signal = False
-    if mayer < MAYER_BUY_THRESHOLD:
-        buy_signal = True
-    if dist_ath > DISTANCE_ATH_THRESHOLD:
+    if mvrv < 0.85 and (mayer < MAYER_BUY_THRESHOLD or dist_ath > DISTANCE_ATH_THRESHOLD):
         buy_signal = True
 
     if buy_signal:
