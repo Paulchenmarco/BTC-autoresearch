@@ -1,27 +1,13 @@
 [project]
-name = "autoresearch"
+name = "btc-autoresearch"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "Autonomous BTC bear-market deployment strategy research"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "kernels>=0.11.7",
-    "matplotlib>=3.10.8",
-    "numpy>=2.2.6",
-    "pandas>=2.3.3",
-    "pyarrow>=21.0.0",
-    "requests>=2.32.0",
-    "rustbpe>=0.1.0",
-    "tiktoken>=0.11.0",
-    "torch==2.9.1",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "yfinance>=0.2",
 ]
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu128" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true

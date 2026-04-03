@@ -1,389 +1,563 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Fixed evaluation harness for BTC bear-market deployment research.
+DO NOT MODIFY — this file is read-only for the autoresearch loop.
+
+Provides:
+    - Data loading and feature construction
+    - Backtest engine (day-by-day simulation)
+    - CSP (cash-secured put) settlement simulation
+    - Scoring function
+    - Naive baselines for reference
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+    Imported by train.py. Not run directly.
 """
 
 import os
-import sys
-import time
 import math
-import argparse
-import pickle
-from multiprocessing import Pool
+import datetime
+from dataclasses import dataclass, field
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+INITIAL_CASH = 50_000.0
+DEFAULT_SPOT_FEE = 0.001       # 10 bps taker fee
+DEFAULT_CSP_FEE = 0.0003       # Deribit maker fee
+MIN_TRADE_USD = 10.0
+BTC_GENESIS = pd.Timestamp("2009-01-03")
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+DEFAULT_DATA_PATH = os.path.join(DATA_DIR, "btc_features.parquet")
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Dataclasses
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+@dataclass
+class OpenCSP:
+    sell_date: datetime.date
+    expiry_date: datetime.date
+    strike: float
+    notional: float
+    premium_usd: float
+    delta_at_sale: float
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+@dataclass
+class PortfolioState:
+    date: datetime.date
+    cash_available: float
+    cash_reserved: float
+    btc_held: float
+    total_premium_earned: float
+    open_csps: list
+    day_index: int
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+@dataclass
+class CSPOrder:
+    delta: float
+    dte: int
+    notional_usd: float
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
 
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+@dataclass
+class Action:
+    spot_buy_usd: float = 0.0
+    csp_sells: list = field(default_factory=list)
+
+
+@dataclass
+class Scenario:
+    name: str
+    start_date: datetime.date
+    end_date: datetime.date
+    description: str
+
+
+@dataclass
+class BacktestResult:
+    scenario_name: str
+    terminal_btc: float
+    total_usd_deployed: float
+    btc_per_usd: float
+    total_premium_earned: float
+    num_spot_buys: int
+    num_csps_sold: int
+    num_csps_assigned: int
+    num_csps_expired_otm: int
+
+
+@dataclass
+class ScoreSummary:
+    composite_score: float
+    per_scenario: dict
 
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# Scenarios
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+def build_scenarios():
+    """Fixed bear-to-recovery scenarios."""
+    return [
+        Scenario(
+            name="bear_2018",
+            start_date=datetime.date(2018, 1, 1),
+            end_date=datetime.date(2019, 6, 26),
+            description="2018 bear: ATH crash ($17k->$3.1k) through recovery to $13.9k",
+        ),
+        Scenario(
+            name="bear_2022",
+            start_date=datetime.date(2021, 11, 11),
+            end_date=datetime.date(2023, 9, 30),
+            description="2022 bear: ATH ($69k) -> LUNA -> FTX ($15.5k) -> recovery to $27k",
+        ),
+    ]
+
+# ---------------------------------------------------------------------------
+# Data loading and feature construction
+# ---------------------------------------------------------------------------
+
+def load_features(path=None):
+    """Load raw OHLC data from parquet."""
+    if path is None:
+        path = DEFAULT_DATA_PATH
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Data file not found at {path}. Run: python scripts/build_dataset.py"
+        )
+    df = pd.read_parquet(path)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    return df
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def _rolling_slope(series, window):
+    """Compute rolling linear regression slope (backward-looking)."""
+    def _slope(arr):
+        n = len(arr)
+        if n < 2 or np.isnan(arr).any():
+            return np.nan
+        x = np.arange(n, dtype=float)
+        x_mean = x.mean()
+        y_mean = arr.mean()
+        num = ((x - x_mean) * (arr - y_mean)).sum()
+        den = ((x - x_mean) ** 2).sum()
+        if den == 0:
+            return 0.0
+        return num / den
+    return series.rolling(window, min_periods=window).apply(_slope, raw=True)
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def construct_features(df):
+    """
+    Add derived features to raw OHLC data.
+    All operations are backward-looking only — no lookahead.
+    """
+    df = df.copy()
+    close = df["close"].astype(float)
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
+    # Moving averages
+    df["sma_50"] = close.rolling(50, min_periods=50).mean()
+    df["sma_200"] = close.rolling(200, min_periods=200).mean()
+    df["ma_200w"] = close.rolling(1400, min_periods=1400).mean()  # ~200 weeks
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    # Mayer Multiple
+    df["mayer_multiple"] = close / df["sma_200"]
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
+    # Returns
+    df["return_1d"] = close.pct_change(1)
+    df["return_7d"] = close.pct_change(7)
+    df["return_30d"] = close.pct_change(30)
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+    # Realized volatility (annualized)
+    log_ret = np.log(close / close.shift(1))
+    df["realized_vol_7d"] = log_ret.rolling(7, min_periods=7).std() * np.sqrt(365)
+    df["realized_vol_30d"] = log_ret.rolling(30, min_periods=30).std() * np.sqrt(365)
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    # Distance from ATH (expanding max — no lookahead)
+    expanding_max = close.expanding(min_periods=1).max()
+    df["distance_from_ath"] = (expanding_max - close) / expanding_max
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+    # Power Law features
+    dates_pd = pd.to_datetime(df["date"])
+    days_since_genesis = (dates_pd - BTC_GENESIS).dt.days.astype(float)
+    df["log_days_since_genesis"] = np.log10(days_since_genesis.clip(lower=1))
+    df["log_price"] = np.log10(close.clip(lower=0.01))
+    # Linear regression on log-log gives power law; residual = deviation from trend
+    # Use expanding regression to avoid lookahead
+    log_d = df["log_days_since_genesis"]
+    log_p = df["log_price"]
+    # Rolling power law residual (expanding OLS)
+    cum_n = np.arange(1, len(df) + 1, dtype=float)
+    cum_x = log_d.cumsum()
+    cum_y = log_p.cumsum()
+    cum_xy = (log_d * log_p).cumsum()
+    cum_xx = (log_d * log_d).cumsum()
+    denom = cum_n * cum_xx - cum_x * cum_x
+    slope = np.where(denom != 0, (cum_n * cum_xy - cum_x * cum_y) / denom, 0)
+    intercept = np.where(denom != 0, (cum_y - slope * cum_x) / cum_n, 0)
+    predicted_log_p = slope * log_d + intercept
+    df["power_law_residual"] = log_p - predicted_log_p
+
+    # Percentile ranks (backward-looking)
+    for col in ["mayer_multiple", "realized_vol_30d", "distance_from_ath", "power_law_residual"]:
+        if col in df.columns:
+            df[f"{col}_pct_365d"] = df[col].rolling(365, min_periods=90).rank(pct=True)
+
+    # Slopes
+    for col in ["mayer_multiple", "distance_from_ath"]:
+        if col in df.columns:
+            df[f"{col}_slope_7d"] = _rolling_slope(df[col], 7)
+            df[f"{col}_slope_30d"] = _rolling_slope(df[col], 30)
+
+    return df
+
+# ---------------------------------------------------------------------------
+# CSP premium model (fixed — agent cannot modify)
+# ---------------------------------------------------------------------------
+
+def _delta_to_strike(delta, spot, iv, dte):
+    """Convert target delta to strike price using BS inverse."""
+    if dte <= 0 or iv <= 0:
+        return spot * (1 - 0.1 * delta)
+    T = dte / 365.0
+    sqrt_T = math.sqrt(T)
+    # For a put, delta ~ -N(-d1). We want |delta| = target.
+    # Approximate: strike = spot * exp(-d1 * iv * sqrt(T) + 0.5 * iv^2 * T)
+    # Using quantile inversion:
+    z = norm.ppf(delta)  # negative for OTM puts
+    strike = spot * math.exp(-iv * sqrt_T * z - 0.5 * iv * iv * T)
+    return max(strike, spot * 0.5)  # floor at 50% OTM
+
+
+def estimate_iv(features, delta, dte):
+    """
+    Estimate implied volatility for a BTC put option.
+    Uses realized vol as base with IV premium and smile adjustment.
+    """
+    rv30 = features.get("realized_vol_30d", 0.60)
+    if rv30 is None or math.isnan(rv30):
+        rv30 = 0.60
+
+    # IV premium over realized vol (BTC typically 1.1-1.3x)
+    iv_premium = 1.20
+
+    # Smile adjustment: OTM puts have higher IV
+    smile_adj = 1.0 + 0.3 * max(0.50 - delta, 0)
+
+    base_iv = rv30 * iv_premium * smile_adj
+    return max(base_iv, 0.20)  # floor at 20%
+
+
+def estimate_premium(csp_order, features):
+    """
+    Estimate put premium using Black-Scholes.
+    Returns premium in USD after fees.
+    """
+    spot = features.get("close", 0)
+    if spot <= 0:
+        return 0.0
+
+    delta = csp_order.delta
+    dte = csp_order.dte
+    notional = csp_order.notional_usd
+
+    if dte <= 0 or notional <= 0:
+        return 0.0
+
+    iv = estimate_iv(features, delta, dte)
+    T = dte / 365.0
+    sqrt_T = math.sqrt(T)
+
+    strike = _delta_to_strike(delta, spot, iv, dte)
+
+    # Black-Scholes put price (r=0 for crypto)
+    d1 = (math.log(spot / strike) + 0.5 * iv * iv * T) / (iv * sqrt_T)
+    d2 = d1 - iv * sqrt_T
+    put_price = strike * norm.cdf(-d2) - spot * norm.cdf(-d1)
+
+    # Scale to notional
+    num_contracts = notional / strike
+    premium_usd = put_price * num_contracts
+
+    # Subtract fees
+    premium_usd *= (1 - DEFAULT_CSP_FEE)
+
+    return max(premium_usd, 0.0), strike
+
+# ---------------------------------------------------------------------------
+# Backtest engine
+# ---------------------------------------------------------------------------
+
+def _settle_expired_csps(portfolio, date, features_df, stats):
+    """Settle CSPs that have expired. Mutates portfolio in place."""
+    still_open = []
+    for csp in portfolio.open_csps:
+        if date >= csp.expiry_date:
+            # Find close price at expiry
+            expiry_rows = [r for r in features_df if r["date"] == csp.expiry_date]
+            if not expiry_rows:
+                # Use closest prior date
+                prior = [r for r in features_df if r["date"] <= csp.expiry_date]
+                if prior:
+                    expiry_rows = [prior[-1]]
+                else:
+                    # Can't settle, free collateral
+                    portfolio.cash_available += csp.notional
+                    portfolio.cash_reserved -= csp.notional
+                    stats["csps_expired_otm"] += 1
+                    continue
+
+            spot_at_expiry = expiry_rows[0]["close"]
+
+            portfolio.cash_reserved -= csp.notional
+
+            if spot_at_expiry < csp.strike:
+                # ITM: cash-settled loss, then immediately buy spot BTC
+                loss = (csp.strike - spot_at_expiry) * (csp.notional / csp.strike)
+                net_cash = csp.notional - loss
+                if net_cash > 0:
+                    btc_bought = (net_cash * (1 - DEFAULT_SPOT_FEE)) / spot_at_expiry
+                    portfolio.btc_held += btc_bought
+                stats["csps_assigned"] += 1
+            else:
+                # OTM: collateral freed, premium already credited
+                portfolio.cash_available += csp.notional
+                stats["csps_expired_otm"] += 1
+        else:
+            still_open.append(csp)
+    portfolio.open_csps = still_open
+
+
+def _validate_action(action, portfolio):
+    """Validate and clamp action to enforce buy-only and cash constraints."""
+    available = portfolio.cash_available
+
+    # Clamp spot buy
+    spot = max(0.0, action.spot_buy_usd)
+    spot = min(spot, available)
+    if spot < MIN_TRADE_USD:
+        spot = 0.0
+    remaining = available - spot
+
+    # Clamp CSP orders
+    valid_csps = []
+    for csp_order in action.csp_sells:
+        notional = max(0.0, csp_order.notional_usd)
+        notional = min(notional, remaining)
+        if notional < MIN_TRADE_USD:
+            continue
+        delta = max(0.05, min(0.50, csp_order.delta))
+        dte = max(1, min(90, csp_order.dte))
+        valid_csps.append(CSPOrder(delta=delta, dte=dte, notional_usd=notional))
+        remaining -= notional
+
+    return Action(spot_buy_usd=spot, csp_sells=valid_csps)
+
+
+def run_backtest(strategy_fn, scenario, features_df):
+    """
+    Run day-by-day backtest of a strategy over a scenario.
+
+    Args:
+        strategy_fn: callable(features_dict, PortfolioState) -> Action
+        scenario: Scenario
+        features_df: DataFrame with columns including 'date', 'close', and derived features
+
+    Returns:
+        BacktestResult
+    """
+    # Pre-filter and convert features to list of dicts for fast lookup
+    mask = (features_df["date"] >= scenario.start_date) & (features_df["date"] <= scenario.end_date)
+    scenario_df = features_df[mask].copy()
+
+    if scenario_df.empty:
+        raise ValueError(f"No data for scenario {scenario.name} ({scenario.start_date} to {scenario.end_date})")
+
+    # Also get prior data for features that might need history
+    all_dates = scenario_df["date"].tolist()
+    feature_records = scenario_df.to_dict("records")
+
+    # Build lookup: date -> feature dict
+    feature_lookup = {r["date"]: r for r in feature_records}
+
+    # For CSP settlement, we need access to features by date
+    all_feature_records = features_df.to_dict("records")
+
+    portfolio = PortfolioState(
+        date=scenario.start_date,
+        cash_available=INITIAL_CASH,
+        cash_reserved=0.0,
+        btc_held=0.0,
+        total_premium_earned=0.0,
+        open_csps=[],
+        day_index=0,
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    stats = {
+        "spot_buys": 0,
+        "csps_sold": 0,
+        "csps_assigned": 0,
+        "csps_expired_otm": 0,
+        "total_usd_deployed": 0.0,
+    }
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    for i, date in enumerate(all_dates):
+        portfolio.date = date
+        portfolio.day_index = i
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+        # 1. Settle expired CSPs
+        _settle_expired_csps(portfolio, date, all_feature_records, stats)
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+        # 2. Get features (no lookahead — only data up to this date)
+        features = feature_lookup.get(date)
+        if features is None:
+            continue
+
+        # 3. Call strategy
+        try:
+            action = strategy_fn(features, portfolio)
+        except Exception:
+            action = Action()
+
+        # 4. Validate
+        action = _validate_action(action, portfolio)
+
+        # 5. Execute spot buy
+        if action.spot_buy_usd > 0:
+            btc_price = features["close"]
+            if btc_price > 0:
+                btc_bought = (action.spot_buy_usd * (1 - DEFAULT_SPOT_FEE)) / btc_price
+                portfolio.btc_held += btc_bought
+                portfolio.cash_available -= action.spot_buy_usd
+                stats["spot_buys"] += 1
+                stats["total_usd_deployed"] += action.spot_buy_usd
+
+        # 6. Execute CSP sells
+        for csp_order in action.csp_sells:
+            result = estimate_premium(csp_order, features)
+            if isinstance(result, tuple):
+                premium, strike = result
+            else:
+                continue
+
+            if premium <= 0:
+                continue
+
+            expiry = date + datetime.timedelta(days=csp_order.dte)
+
+            open_csp = OpenCSP(
+                sell_date=date,
+                expiry_date=expiry,
+                strike=strike,
+                notional=csp_order.notional_usd,
+                premium_usd=premium,
+                delta_at_sale=csp_order.delta,
+            )
+            portfolio.open_csps.append(open_csp)
+            portfolio.cash_reserved += csp_order.notional_usd
+            portfolio.cash_available -= csp_order.notional_usd
+            portfolio.cash_available += premium
+            portfolio.total_premium_earned += premium
+            stats["csps_sold"] += 1
+
+    # Force-settle remaining CSPs at scenario end
+    _settle_expired_csps(portfolio, scenario.end_date + datetime.timedelta(days=365),
+                         all_feature_records, stats)
+
+    # Any remaining reserved cash becomes available (safety)
+    portfolio.cash_available += portfolio.cash_reserved
+    portfolio.cash_reserved = 0.0
+
+    terminal_btc = portfolio.btc_held
+    total_deployed = stats["total_usd_deployed"]
+    btc_per_usd = terminal_btc / total_deployed if total_deployed > 0 else 0.0
+
+    return BacktestResult(
+        scenario_name=scenario.name,
+        terminal_btc=terminal_btc,
+        total_usd_deployed=total_deployed,
+        btc_per_usd=btc_per_usd,
+        total_premium_earned=portfolio.total_premium_earned,
+        num_spot_buys=stats["spot_buys"],
+        num_csps_sold=stats["csps_sold"],
+        num_csps_assigned=stats["csps_assigned"],
+        num_csps_expired_otm=stats["csps_expired_otm"],
+    )
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# Naive baselines (for reference only, not part of scoring)
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+def _run_naive_lump_sum(scenario, features_df):
+    """Buy all BTC on day 1."""
+    mask = (features_df["date"] >= scenario.start_date) & (features_df["date"] <= scenario.end_date)
+    sdf = features_df[mask]
+    if sdf.empty:
+        return 0.0
+    first_close = sdf.iloc[0]["close"]
+    if first_close <= 0:
+        return 0.0
+    return (INITIAL_CASH * (1 - DEFAULT_SPOT_FEE)) / first_close
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def _run_naive_dca(scenario, features_df):
+    """Buy equal weekly amounts over the period."""
+    mask = (features_df["date"] >= scenario.start_date) & (features_df["date"] <= scenario.end_date)
+    sdf = features_df[mask]
+    if sdf.empty:
+        return 0.0
 
+    # Weekly buys (every 7th trading day)
+    weekly_rows = sdf.iloc[::7]
+    n_weeks = len(weekly_rows)
+    if n_weeks == 0:
+        return 0.0
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
+    weekly_amount = INITIAL_CASH / n_weeks
+    total_btc = 0.0
+    for _, row in weekly_rows.iterrows():
+        price = row["close"]
+        if price > 0:
+            total_btc += (weekly_amount * (1 - DEFAULT_SPOT_FEE)) / price
+    return total_btc
 
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def score_results(results):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    Score backtest results across scenarios.
+    Composite score = arithmetic mean of terminal BTC.
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    terminal_btcs = [r.terminal_btc for r in results]
+    composite = sum(terminal_btcs) / len(terminal_btcs) if terminal_btcs else 0.0
+    per_scenario = {r.scenario_name: r for r in results}
+    return ScoreSummary(composite_score=composite, per_scenario=per_scenario)
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+def print_results(summary, scenarios, features_df):
+    """Print results in the format expected by program.md."""
+    print("---")
+    print(f"composite_score:      {summary.composite_score:.6f}")
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
-
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    for scenario in scenarios:
+        result = summary.per_scenario.get(scenario.name)
+        if result:
+            lump = _run_naive_lump_sum(scenario, features_df)
+            dca = _run_naive_dca(scenario, features_df)
+            print(f"scenario: {result.scenario_name:20s}  "
+                  f"terminal_btc: {result.terminal_btc:.6f}  "
+                  f"btc_per_usd: {result.btc_per_usd:.10f}  "
+                  f"premium: ${result.total_premium_earned:.2f}  "
+                  f"spot_buys: {result.num_spot_buys}  "
+                  f"csps: {result.num_csps_sold} "
+                  f"(assigned: {result.num_csps_assigned} otm: {result.num_csps_expired_otm})  "
+                  f"| baseline lump: {lump:.6f}  dca: {dca:.6f}")
