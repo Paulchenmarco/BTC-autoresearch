@@ -65,10 +65,13 @@ def decide_action(features, portfolio):
     spot_buy = 0.0
     csps = []
 
-    # --- Spot buy logic: use power law residual for scaling ---
+    # --- Spot buy logic: use power law residual and 7d return for scaling ---
     pl_resid = features.get("power_law_residual")
     if pl_resid is None or (isinstance(pl_resid, float) and pl_resid != pl_resid):
         pl_resid = 0.0
+    ret_7d = features.get("return_7d")
+    if ret_7d is None or (isinstance(ret_7d, float) and ret_7d != ret_7d):
+        ret_7d = 0.0
 
     buy_signal = False
     if mayer < MAYER_BUY_THRESHOLD:
@@ -85,6 +88,9 @@ def decide_action(features, portfolio):
             scale = 2.0
         elif pl_resid < -0.1:
             scale = 1.5
+        # Buy more after sharp drops (mean reversion opportunity)
+        if ret_7d < -0.15:
+            scale *= 1.5
         spot_buy = cash * SPOT_DEPLOY_FRACTION * scale
 
     # --- CSP logic: keep idle cash productive ---
