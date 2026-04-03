@@ -94,6 +94,14 @@ def decide_action(features, portfolio):
         # Buy more after sharp drops (mean reversion opportunity)
         if ret_7d < -0.15:
             scale *= 1.5
+        # Buy more when hash ribbon is in recovery (miner capitulation ending)
+        hr_signal = features.get("hash_ribbon_signal")
+        hr_ratio = features.get("hash_ribbon_ratio")
+        if hr_signal is not None and hr_ratio is not None:
+            if not (isinstance(hr_signal, float) and hr_signal != hr_signal):
+                if hr_signal == 1.0 and isinstance(hr_ratio, float) and not (hr_ratio != hr_ratio):
+                    if hr_ratio < 1.05:  # Just crossed above — early recovery
+                        scale *= 1.5
         spot_buy = cash * SPOT_DEPLOY_FRACTION * scale
 
     # --- CSP logic: keep idle cash productive ---
