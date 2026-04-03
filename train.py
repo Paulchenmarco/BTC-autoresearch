@@ -26,7 +26,7 @@ DEPTH_MULT = 12.0
 CSP_SELL_ABOVE = 0.95         # Sell puts when MVRV > this (rolling protects lower entries)
 CSP_DELTA = 0.14
 CSP_DTE = 14
-CSP_ALLOC = 0.95
+CSP_ALLOC = 1.00              # All available cash as collateral
 
 # Roll parameters
 CSP_ROLL_TRIGGER = 2.5        # Roll when put value reaches 2.5x premium received
