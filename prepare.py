@@ -680,9 +680,21 @@ def _settle_expired_calls(portfolio, date, features_df, stats):
     portfolio.open_calls = still_open
 
 
-def _validate_action(action, portfolio):
+def _validate_action(action, portfolio, features=None):
     """Validate and clamp action to enforce buy-only and cash constraints."""
     available = portfolio.cash_available
+
+    # Account for cash that will be freed by CSP closes (closes happen before buys)
+    for idx in action.close_csp_indices:
+        if 0 <= idx < len(portfolio.open_csps):
+            csp = portfolio.open_csps[idx]
+            # Estimate freed cash: collateral minus buyback cost
+            if features is not None:
+                buyback = reprice_csp(csp, features)
+                buyback *= (1 + DEFAULT_CSP_FEE)
+                available += csp.notional - buyback
+            else:
+                available += csp.notional  # optimistic estimate
 
     # Clamp spot buy
     spot = max(0.0, action.spot_buy_usd)
@@ -785,7 +797,7 @@ def run_backtest(strategy_fn, scenario, features_df):
             action = Action()
 
         # 4. Validate
-        action = _validate_action(action, portfolio)
+        action = _validate_action(action, portfolio, features)
 
         # 5. Close CSPs early (take profit / cut loss — strategy decision)
         if action.close_csp_indices:
