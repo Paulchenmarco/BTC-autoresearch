@@ -18,7 +18,7 @@ from prepare import (
 # ---------------------------------------------------------------------------
 
 # MVRV gate and depth scaling
-MVRV_THRESHOLD = 0.80
+MVRV_THRESHOLD = 0.82
 DEPTH_BASE = 0.10
 DEPTH_MULT = 11.0
 
