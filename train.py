@@ -24,9 +24,8 @@ PL_RESID_THRESHOLD = -0.40
 RV30_THRESHOLD = 0.70
 
 # Deployment sizing by conviction level
-DEPLOY_4_SIGNALS = 0.50     # 4/4 signals: deploy 50% of cash
-DEPLOY_3_SIGNALS = 0.30     # 3/4 signals: deploy 30%
-DEPLOY_2_SIGNALS = 0.15     # 2/4 signals: deploy 15%
+DEPLOY_4_SIGNALS = 0.60     # 4/4 signals: deploy 60% of cash
+DEPLOY_3_SIGNALS = 0.35     # 3/4 signals: deploy 35%
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,14 +63,12 @@ def decide_action(features, portfolio):
     if rv30 > RV30_THRESHOLD:
         signals += 1
 
-    # Deploy based on conviction
+    # Deploy based on conviction — minimum 3 signals required
     spot_buy = 0.0
     if signals >= 4:
         spot_buy = cash * DEPLOY_4_SIGNALS
     elif signals >= 3:
         spot_buy = cash * DEPLOY_3_SIGNALS
-    elif signals >= 2:
-        spot_buy = cash * DEPLOY_2_SIGNALS
 
     return Action(spot_buy_usd=spot_buy)
 
