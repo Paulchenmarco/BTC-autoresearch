@@ -22,7 +22,7 @@ SPOT_DEPLOY_FRACTION = 0.10     # Fraction of available cash per spot buy
 
 # CSP parameters
 CSP_DEPLOY_FRACTION = 0.50      # Fraction of idle cash to deploy as CSP collateral
-CSP_DEFAULT_DELTA = 0.25        # Default delta for put sells
+CSP_DEFAULT_DELTA = 0.20        # Default delta for put sells (lower = fewer assignments)
 CSP_DEFAULT_DTE = 30            # Default DTE
 CSP_AGGRESSIVE_DELTA = 0.35     # Higher delta when deep in bear
 CSP_CONSERVATIVE_DELTA = 0.15   # Lower delta in high vol
@@ -65,7 +65,11 @@ def decide_action(features, portfolio):
     spot_buy = 0.0
     csps = []
 
-    # --- Spot buy logic ---
+    # --- Spot buy logic: use power law residual for scaling ---
+    pl_resid = features.get("power_law_residual")
+    if pl_resid is None or (isinstance(pl_resid, float) and pl_resid != pl_resid):
+        pl_resid = 0.0
+
     buy_signal = False
     if mayer < MAYER_BUY_THRESHOLD:
         buy_signal = True
@@ -73,7 +77,13 @@ def decide_action(features, portfolio):
         buy_signal = True
 
     if buy_signal:
-        spot_buy = cash * SPOT_DEPLOY_FRACTION
+        # Scale up when price is below power law trend
+        scale = 1.0
+        if pl_resid < -0.3:
+            scale = 2.0
+        elif pl_resid < -0.1:
+            scale = 1.5
+        spot_buy = cash * SPOT_DEPLOY_FRACTION * scale
 
     # --- CSP logic: keep idle cash productive ---
     remaining = cash - spot_buy
