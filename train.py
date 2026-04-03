@@ -21,7 +21,7 @@ DISTANCE_ATH_THRESHOLD = 0.60   # Buy spot when >60% below ATH
 SPOT_DEPLOY_FRACTION = 0.08     # Fraction of available cash per spot buy
 
 # CSP parameters
-CSP_DEPLOY_FRACTION = 0.20      # Fraction of idle cash to deploy as CSP collateral
+CSP_DEPLOY_FRACTION = 0.10      # Fraction of idle cash to deploy as CSP collateral
 CSP_DEFAULT_DELTA = 0.15        # Default delta for put sells (lower = fewer assignments)
 CSP_DEFAULT_DTE = 90            # Default DTE (max allowed)
 CSP_AGGRESSIVE_DELTA = 0.35     # Higher delta when deep in bear
