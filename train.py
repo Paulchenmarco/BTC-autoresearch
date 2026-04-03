@@ -26,7 +26,7 @@ DEPTH_MULT = 13.0
 CSP_SELL_ABOVE = 1.80         # Sell puts only when MVRV > 1.80
 CSP_DELTA = 0.10
 CSP_DTE = 30
-CSP_ALLOC = 0.50              # 50% of cash
+CSP_ALLOC = 0.60              # 60% of cash
 
 # ---------------------------------------------------------------------------
 # Helpers
