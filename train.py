@@ -23,9 +23,10 @@ DIST_ATH_THRESHOLD = 0.75
 PL_RESID_THRESHOLD = -0.40
 RV30_THRESHOLD = 0.70
 
-# Deployment sizing by conviction level
-DEPLOY_4_SIGNALS = 0.60     # 4/4 signals: deploy 60% of cash
-DEPLOY_3_SIGNALS = 0.35     # 3/4 signals: deploy 35%
+# Deployment sizing: MVRV required + secondary signal count
+DEPLOY_4_SIGNALS = 0.60     # MVRV + 3/3 secondary: deploy 60%
+DEPLOY_3_SIGNALS = 0.35     # MVRV + 2/3 secondary: deploy 35%
+DEPLOY_2_SIGNALS = 0.15     # MVRV + 1/3 secondary: deploy 15%
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -52,23 +53,24 @@ def decide_action(features, portfolio):
     pl_resid = _safe(features.get("power_law_residual"), 0.0)
     rv30 = _safe(features.get("realized_vol_30d"), 0.40)
 
-    # Count conviction signals
-    signals = 0
-    if mvrv < MVRV_THRESHOLD:
-        signals += 1
+    # Count secondary conviction signals (MVRV is mandatory gate)
+    secondary = 0
     if dist_ath > DIST_ATH_THRESHOLD:
-        signals += 1
+        secondary += 1
     if pl_resid < PL_RESID_THRESHOLD:
-        signals += 1
+        secondary += 1
     if rv30 > RV30_THRESHOLD:
-        signals += 1
+        secondary += 1
 
-    # Deploy based on conviction — minimum 3 signals required
+    # Deploy: MVRV must be below threshold, then scale by secondary signal count
     spot_buy = 0.0
-    if signals >= 4:
-        spot_buy = cash * DEPLOY_4_SIGNALS
-    elif signals >= 3:
-        spot_buy = cash * DEPLOY_3_SIGNALS
+    if mvrv < MVRV_THRESHOLD:
+        if secondary >= 3:
+            spot_buy = cash * DEPLOY_4_SIGNALS
+        elif secondary >= 2:
+            spot_buy = cash * DEPLOY_3_SIGNALS
+        elif secondary >= 1:
+            spot_buy = cash * DEPLOY_2_SIGNALS
 
     return Action(spot_buy_usd=spot_buy)
 
