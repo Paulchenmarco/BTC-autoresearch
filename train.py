@@ -18,7 +18,7 @@ from prepare import (
 # Spot buy triggers
 MAYER_BUY_THRESHOLD = 0.8       # Buy spot when Mayer Multiple < this
 DISTANCE_ATH_THRESHOLD = 0.60   # Buy spot when >60% below ATH
-SPOT_DEPLOY_FRACTION = 0.10     # Fraction of available cash per spot buy
+SPOT_DEPLOY_FRACTION = 0.08     # Fraction of available cash per spot buy
 
 # CSP parameters
 CSP_DEPLOY_FRACTION = 0.50      # Fraction of idle cash to deploy as CSP collateral
