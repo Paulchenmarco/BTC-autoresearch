@@ -23,15 +23,15 @@ DEPTH_BASE = 0.10
 DEPTH_MULT = 12.0
 
 # Put selling
-CSP_SELL_ABOVE = 1.50         # Sell puts when MVRV > this (rolling protects lower entries)
+CSP_SELL_ABOVE = 1.30         # Sell puts when MVRV > this (rolling protects lower entries)
 CSP_DELTA = 0.14
 CSP_DTE = 14
 CSP_ALLOC = 0.95
 
-# Roll parameters: when a put doubles in value (moving against us), roll down and out
-CSP_ROLL_TRIGGER = 2.0        # Roll when put value reaches 2x premium received
-CSP_ROLL_DELTA = 0.10         # Roll to a lower delta (further OTM)
-CSP_ROLL_DTE = 30             # Roll to longer DTE (more time value to offset cost)
+# Roll parameters
+CSP_ROLL_TRIGGER = 2.5        # Roll when put value reaches 2.5x premium received
+CSP_ROLL_DELTA = 0.05         # Roll to very low delta (far OTM)
+CSP_ROLL_DTE = 21             # Roll to 3-week DTE
 
 # ---------------------------------------------------------------------------
 # Helpers
