@@ -17,10 +17,14 @@ from prepare import (
 # Strategy parameters (edit these)
 # ---------------------------------------------------------------------------
 
-# MVRV gate and depth scaling for spot buys
+# Gate: MVRV must be below this to buy
 MVRV_THRESHOLD = 0.80
-DEPTH_BASE = 0.10
-DEPTH_MULT = 11.0
+
+# Depth scaling: use MVRV-Z as secondary indicator
+# Deploy more when MVRV-Z is deeply negative (extreme undervaluation)
+Z_BASE = 0.10                 # base fraction when Z just crosses ref
+Z_MULT = 3.2                  # scaling multiplier
+Z_REF = 0.40                  # reference Z level (depth = 0 when Z = -ref)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,12 +47,14 @@ def decide_action(features, portfolio):
         return Action()
 
     mvrv = _safe(features.get("mvrv_ratio"), 1.0)
+    mvrv_z = _safe(features.get("mvrv_z_score"), 0.0)
 
     spot_buy = 0.0
 
     if mvrv < MVRV_THRESHOLD:
-        depth = (MVRV_THRESHOLD - mvrv) / MVRV_THRESHOLD
-        frac = DEPTH_BASE + depth * DEPTH_MULT
+        # MVRV-Z depth: more negative Z = more aggressive deployment
+        z_depth = max(0, (-mvrv_z - Z_REF)) / Z_REF
+        frac = Z_BASE + z_depth * Z_MULT
         frac = min(frac, 1.0)
         spot_buy = cash * frac
         if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
