@@ -30,7 +30,7 @@ CSP_ALLOC = 1.00              # All available cash as collateral
 
 # Roll parameters
 CSP_ROLL_TRIGGER = 2.5        # Roll when put value reaches 2.5x premium received
-CSP_ROLL_DELTA = 0.05         # Roll to very low delta (far OTM)
+CSP_ROLL_DELTA = 0.08         # Roll to low delta (far OTM, but more premium than 0.05)
 CSP_ROLL_DTE = 21             # Roll to 3-week DTE
 
 # ---------------------------------------------------------------------------
