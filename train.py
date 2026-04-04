@@ -15,31 +15,37 @@ from prepare import (
 )
 
 # ---------------------------------------------------------------------------
-# MVRV bottom regression
+# MVRV bottom regression (walk-forward: only use prior cycles)
 # ---------------------------------------------------------------------------
 
-# Historical cycle bottoms: {cycle: mvrv_bottom}
+# Historical cycle bottoms
 CYCLE_BOTTOMS = {1: 0.387, 2: 0.564, 3: 0.690, 4: 0.754}
 
-# Fit: MVRV_bottom = 1.0 - a * exp(-b * cycle)
-_cn = np.array(list(CYCLE_BOTTOMS.keys()), dtype=float)
-_mb = np.array(list(CYCLE_BOTTOMS.values()))
-_slope, _intercept = np.polyfit(_cn, np.log(1.0 - _mb), 1)
-_A, _B = np.exp(_intercept), -_slope
-
-def predicted_mvrv_bottom(cycle_num):
-    return 1.0 - _A * np.exp(-_B * cycle_num)
+def predict_mvrv_bottom_walk_forward(target_cycle):
+    """Predict MVRV bottom using only cycles BEFORE the target (no look-ahead)."""
+    prior = {c: v for c, v in CYCLE_BOTTOMS.items() if c < target_cycle}
+    if len(prior) < 2:
+        return 0.80  # fallback
+    cn = np.array(list(prior.keys()), dtype=float)
+    mb = np.array(list(prior.values()))
+    if len(cn) == 2:
+        # Linear extrapolation
+        slope, intercept = np.polyfit(cn, mb, 1)
+        return slope * target_cycle + intercept
+    else:
+        # Exponential decay: bottom = 1.0 - a * exp(-b * cycle)
+        gaps = 1.0 - mb
+        log_gaps = np.log(gaps)
+        slope, intercept = np.polyfit(cn, log_gaps, 1)
+        a, b = np.exp(intercept), -slope
+        return 1.0 - a * np.exp(-b * target_cycle)
 
 # ---------------------------------------------------------------------------
 # Strategy parameters
 # ---------------------------------------------------------------------------
 
-# Current cycle number (update each cycle)
 CURRENT_CYCLE = 5
-
-# Gate: predicted bottom + margin
 GATE_MARGIN = 0.02
-MVRV_GATE = predicted_mvrv_bottom(CURRENT_CYCLE) + GATE_MARGIN
 
 # Depth scaling via MVRV-Z
 Z_BASE = 0.05
@@ -61,25 +67,31 @@ def _safe(val, default=0.0):
 # Strategy logic
 # ---------------------------------------------------------------------------
 
-def decide_action(features, portfolio):
-    cash = portfolio.cash_available
-    if cash < 10:
-        return Action()
+def make_strategy(cycle_num):
+    """Create a strategy function for a specific cycle (walk-forward gate)."""
+    gate = predict_mvrv_bottom_walk_forward(cycle_num) + GATE_MARGIN
 
-    mvrv = _safe(features.get("mvrv_ratio"), 1.0)
-    mvrv_z = _safe(features.get("mvrv_z_score"), 0.0)
+    def decide_action(features, portfolio):
+        cash = portfolio.cash_available
+        if cash < 10:
+            return Action()
 
-    spot_buy = 0.0
+        mvrv = _safe(features.get("mvrv_ratio"), 1.0)
+        mvrv_z = _safe(features.get("mvrv_z_score"), 0.0)
 
-    if mvrv < MVRV_GATE:
-        z_depth = max(0, (-mvrv_z - Z_REF)) / Z_REF
-        frac = Z_BASE + z_depth * Z_MULT
-        frac = min(frac, 1.0)
-        spot_buy = cash * frac
-        if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
-            spot_buy = cash
+        spot_buy = 0.0
 
-    return Action(spot_buy_usd=spot_buy)
+        if mvrv < gate:
+            z_depth = max(0, (-mvrv_z - Z_REF)) / Z_REF
+            frac = Z_BASE + z_depth * Z_MULT
+            frac = min(frac, 1.0)
+            spot_buy = cash * frac
+            if portfolio.btc_held > 0 and cash < 5000 and spot_buy > 0:
+                spot_buy = cash
+
+        return Action(spot_buy_usd=spot_buy)
+
+    return decide_action, gate
 
 # ---------------------------------------------------------------------------
 # Main
@@ -88,38 +100,23 @@ def decide_action(features, portfolio):
 if __name__ == "__main__":
     features_df = load_features()
     features_df = construct_features(features_df)
-
-    print(f"Cycle {CURRENT_CYCLE}: predicted bottom MVRV = {predicted_mvrv_bottom(CURRENT_CYCLE):.3f}")
-    print(f"Gate (+ {GATE_MARGIN} margin): MVRV < {MVRV_GATE:.3f}")
-    print()
-
-    # Backtest using cycle-specific gates for historical scenarios
     scenarios = build_scenarios()
     cycle_map = {"bear_2018": 3, "bear_2022": 4}
+
+    print("Walk-forward MVRV regression (no look-ahead):")
+    for c in [3, 4, 5]:
+        pred = predict_mvrv_bottom_walk_forward(c)
+        actual = CYCLE_BOTTOMS.get(c)
+        actual_str = f"{actual:.3f}" if actual else "???"
+        print(f"  Cycle {c}: predicted={pred:.3f}  actual={actual_str}  gate={pred + GATE_MARGIN:.3f}")
+    print()
 
     results = []
     for scenario in scenarios:
         cycle = cycle_map.get(scenario.name, CURRENT_CYCLE)
-        gate = predicted_mvrv_bottom(cycle) + GATE_MARGIN
-
-        def make_strategy(g=gate):
-            def strategy(features, portfolio):
-                cash = portfolio.cash_available
-                if cash < 10: return Action()
-                mvrv = _safe(features.get("mvrv_ratio"), 1.0)
-                mvrv_z = _safe(features.get("mvrv_z_score"), 0.0)
-                if mvrv < g:
-                    z_depth = max(0, (-mvrv_z - Z_REF)) / Z_REF
-                    frac = Z_BASE + z_depth * Z_MULT
-                    frac = min(frac, 1.0)
-                    spot_buy = cash * frac
-                    if portfolio.btc_held > 0 and cash < 5000: spot_buy = cash
-                    return Action(spot_buy_usd=spot_buy)
-                return Action()
-            return strategy
-
+        strategy, gate = make_strategy(cycle)
         print(f"Running {scenario.name} (cycle {cycle}, gate={gate:.3f})...")
-        result = run_backtest(make_strategy(), scenario, features_df)
+        result = run_backtest(strategy, scenario, features_df)
         results.append(result)
 
     summary = score_results(results)
