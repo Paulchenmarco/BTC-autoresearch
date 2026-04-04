@@ -20,7 +20,7 @@ from prepare import (
 # MVRV gate and depth scaling for spot buys
 MVRV_THRESHOLD = 0.80
 DEPTH_BASE = 0.10
-DEPTH_MULT = 12.0
+DEPTH_MULT = 13.0
 
 # Put selling
 CSP_SELL_ABOVE = 0.95         # Sell puts when MVRV > this (rolling protects lower entries)
