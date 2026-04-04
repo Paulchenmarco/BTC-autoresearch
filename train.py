@@ -18,12 +18,12 @@ from prepare import (
 # ---------------------------------------------------------------------------
 
 # Gate: MVRV must be below this to buy
-MVRV_THRESHOLD = 0.80
+MVRV_THRESHOLD = 0.78
 
 # Depth scaling: use MVRV-Z as secondary indicator
 # Deploy more when MVRV-Z is deeply negative (extreme undervaluation)
-Z_BASE = 0.10                 # base fraction when Z just crosses ref
-Z_MULT = 3.2                  # scaling multiplier
+Z_BASE = 0.08                 # base fraction when Z just crosses ref
+Z_MULT = 4.0                  # scaling multiplier
 Z_REF = 0.40                  # reference Z level (depth = 0 when Z = -ref)
 
 # ---------------------------------------------------------------------------
